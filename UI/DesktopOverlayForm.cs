@@ -1184,6 +1184,12 @@ namespace DesktopIconManager.UI
             dirty.Intersect(new Rectangle(0, 0, w, h));
             if (partial && (dirty.Width <= 0 || dirty.Height <= 0)) return;
 
+            // 脏区是「两个矩形的包围盒」：鼠标从左上角盒子划到右下角盒子时，
+            // 包围盒几乎等于整屏。这时走局部不但没有收益（清屏+重绘范围一样大），
+            // 还多一次判断开销 —— 直接整屏更稳。
+            if (partial && (long)dirty.Width * dirty.Height * 2 > (long)w * h)
+                partial = false;
+
             if (!partial)
             {
                 Render();
@@ -1575,7 +1581,16 @@ namespace DesktopIconManager.UI
                 // ★ 关键：GDI 资源**始终按整屏尺寸**分配。
                 // 若按脏区尺寸分配，脏区每帧大小都在变，DIBSection 就会被反复
                 // 重建 —— 反而比整屏重绘更糟。整屏分配一次，局部更新只填子区域。
+
+                // 资源是本次才新建的话，DIB 里 dirty 之外还是一片 0，
+                // 这时绝不能走局部 —— 否则未更新区域会变成透明空洞。
+                bool fresh = (_blitBmp == IntPtr.Zero || _blitBuffer == null
+                              || _blitW != bmp.Width || _blitH != bmp.Height);
+
                 if (!EnsureBlitResources(screenDc, bmp.Width, bmp.Height)) return;
+
+                if (fresh)
+                    rect = new Rectangle(0, 0, _blitW, _blitH);
 
                 int fullStride = _blitW * 4;
                 int rowBytes = rect.Width * 4;
@@ -1635,9 +1650,21 @@ namespace DesktopIconManager.UI
                 blend.SourceConstantAlpha = 255;
                 blend.AlphaFormat = OverlayNative.AC_SRC_ALPHA;
 
-                var srcPt = new OverlayNative.POINT { X = rect.X, Y = rect.Y };
-                var size = new OverlayNative.SIZE { cx = rect.Width, cy = rect.Height };
-                var dstPt = new OverlayNative.POINT { X = Left + rect.X, Y = Top + rect.Y };
+                // ★★ 提交必须**始终按整屏尺寸** —— 这是分层窗口最容易踩的坑：
+                //
+                // UpdateLayeredWindow 的 pptDst / psize 定义的是**整个窗口的新位置与新尺寸**，
+                // 不是"要更新的子矩形"。若传局部矩形（dst=Left+rect.X、size=rect 尺寸），
+                // 系统会把覆盖层窗口整个**挪到子区域的位置并缩放到子区域的尺寸**：
+                //   · 画面表现 = 每次重绘所有面板都在跳（观感就是「满屏栅格闪烁」）
+                //   · 更隐蔽的后果 = 窗口 Location/Size 被改 → ToLocal 的 _origin 漂移
+                //     → 命中测试整体错位 → 点分类标签、点图标全部落空
+                //
+                // 所以：绘制与拷贝可以只做 dirty 区域（这才是有意义的那部分优化），
+                // 最后一步提交必须是整屏。源 DC 里 dirty 之外的像素保留上一次的值，
+                // 与整屏重绘的结果逐像素一致。
+                var srcPt = new OverlayNative.POINT { X = 0, Y = 0 };
+                var size = new OverlayNative.SIZE { cx = _blitW, cy = _blitH };
+                var dstPt = new OverlayNative.POINT { X = Left, Y = Top };
 
                 OverlayNative.UpdateLayeredWindow(Handle, screenDc, ref dstPt, ref size,
                     _blitMemDc, ref srcPt, 0, ref blend, OverlayNative.ULW_ALPHA);
