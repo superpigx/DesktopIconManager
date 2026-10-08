@@ -729,10 +729,21 @@ namespace DesktopIconManager.UI
         }
 
         /// <summary>
-        /// 把一个分组并入另一个分组：条目全部转移，源分组删除。
+        /// 把一个收纳盒的条目并入另一个收纳盒，源盒随后删除。
         ///
-        /// 只调整分组归属，**不会删除任何磁盘文件**。
-        /// 重复条目（同一路径已在目标分组里）会自动跳过。
+        /// ★ 两种语义，按参与方是否含多分类自动选择 —— 这是本次修复的核心：
+        ///   1. 两盒都只有 1 个分类 —— 沿用老行为：条目并入目标的当前分类。
+        ///   2. 任一盒是多分类 —— **分类保真并入**：源盒每个分类的条目
+        ///      各自落到目标盒的同名分类（没有就新建为一个独立标签页），
+        ///      各标签页继续独立渲染、独立切换，不会被揉成一团。
+        ///
+        /// 之所以必须分情况：老实现无条件把 src.Items（**当前**分类）塞进
+        /// dst.Items（目标的**当前**分类），随后直接 RemoveAt(srcIndex) 删掉整个源盒 ——
+        ///   ① 源盒其余分类的条目就此从布局里消失（文件还在磁盘，但看不见也点不到）
+        ///   ② 目标盒的当前分类被灌进一堆不属于它的内容
+        /// 两个后果叠加，正是「合并后 Tab 内容被一并合并、各面板无法独立显示」。
+        ///
+        /// 只调整分组归属，**不会删除任何磁盘文件**；重复路径自动跳过。
         /// </summary>
         private bool MergeGroups(int srcIndex, int dstIndex)
         {
@@ -743,29 +754,94 @@ namespace DesktopIconManager.UI
             FenceBox src = _layout.Groups[srcIndex];
             FenceBox dst = _layout.Groups[dstIndex];
 
-            // 先把要移入的条目挑出来（去重），再询问 ——
-            // 这样提示里能给出准确的数字
-            var incoming = new List<GroupItem>();
-            foreach (GroupItem it in src.Items)
+            // 单盒锁定：合并会改变布局与归属，锁着的盒子请先解锁再操作
+            if (src.Locked || dst.Locked)
             {
-                if (!ContainsPath(dstIndex, it.FullPath))
-                    incoming.Add(it);
+                MessageBox.Show(this,
+                    "参与合并的收纳盒中有被锁定的（标题栏的锁）。\n" +
+                    "请先解锁再合并。",
+                    "已锁定", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return false;
+            }
+
+            // 只有双方都是单分类时，「并入同一个分类」才不破坏任何结构
+            bool tabAware = (src.Tabs.Count > 1 || dst.Tabs.Count > 1);
+
+            // 先算清楚会搬多少、重复多少，再询问 —— 提示里要给出准确数字
+            int incoming = 0, dup = 0;
+            foreach (FenceTab st in src.Tabs)
+            {
+                foreach (GroupItem it in st.Items)
+                {
+                    if (ContainsPathInBox(dst, it.FullPath)) dup++;
+                    else incoming++;
+                }
+            }
+
+            if (incoming == 0)
+            {
+                MessageBox.Show(this,
+                    "「" + src.Title + "」里的条目已经都在「" + dst.Title + "」中了，无需合并。",
+                    "合并分组", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return false;
+            }
+
+            string modeNote;
+            if (!tabAware)
+            {
+                modeNote = "条目会并入「" + dst.Title + "」。";
+            }
+            else if (src.Tabs.Count > 1)
+            {
+                modeNote = "「" + src.Title + "」的 " + src.Tabs.Count +
+                           " 个分类会分别并入同名分类，\n各自保持独立，仍可分别切换查看。";
+            }
+            else
+            {
+                modeNote = "「" + dst.Title + "」是多分类收纳盒，\n" +
+                           "条目会并入同名分类，不会混进其它分类。";
             }
 
             var answer = MessageBox.Show(this,
                 "把「" + src.Title + "」合并进「" + dst.Title + "」？\n\n" +
-                "「" + src.Title + "」共 " + src.Items.Count + " 个条目，\n" +
-                "其中 " + incoming.Count + " 个会被移入目标分组" +
-                (src.Items.Count - incoming.Count > 0
-                    ? "（" + (src.Items.Count - incoming.Count) + " 个重复，将跳过）"
-                    : "") + "。\n\n" +
+                modeNote + "\n\n" +
+                "共 " + incoming + " 个条目会被移入" +
+                (dup > 0 ? "（另有 " + dup + " 个重复，将跳过）" : "") + "。\n\n" +
                 "只调整分组，不会删除任何文件。",
                 "合并分组", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
 
             if (answer != DialogResult.Yes) return false;
 
-            foreach (GroupItem it in incoming)
-                dst.Items.Add(it);
+            if (!tabAware)
+            {
+                foreach (GroupItem it in src.Items)
+                    if (!ContainsPathInBox(dst, it.FullPath))
+                        dst.Items.Add(it);
+
+                // 条目已转交完毕，源盒就地清空。
+                // 注意清的是**列表**而不是条目对象 —— 目标盒持有的是同一批
+                // GroupItem 引用，这里 Remove 不会影响它们。
+                // 不清空的话，下面那条「还有条目没落地」的防御检查会永远为真。
+                foreach (FenceTab st in src.Tabs) st.Items.Clear();
+            }
+            else
+            {
+                MergeTabsPreserving(src, dst);
+            }
+
+            // 安全网：源盒还有没落地的分类就绝不删它 —— 宁可多留一个空盒，
+            // 也不能让条目从布局里消失（文件还在，但用户看不见也点不到）
+            int left = 0;
+            foreach (FenceTab st in src.Tabs) left += st.Items.Count;
+
+            if (left > 0)
+            {
+                AppLog.Warn("MergeGroups 源盒仍有 " + left + " 个条目未落地，已保留源盒");
+                AutoFitPanel(srcIndex);
+                MarkDirty();
+                Render();
+                return false;
+            }
 
             // 删除源分组。注意：若目标在源之后，其索引会前移一位。
             int dstAfterRemove = dstIndex > srcIndex ? dstIndex - 1 : dstIndex;
@@ -778,6 +854,110 @@ namespace DesktopIconManager.UI
             MarkDirty();
             Render();
             return true;
+        }
+
+        /// <summary>
+        /// 把一个盒的各分类保真并入另一个盒（供 MergeGroups 的多分类分支使用）。
+        ///
+        /// 规则按优先级依次是：
+        ///   1. 目标里有同名分类 → 条目并入该分类，重复跳过
+        ///   2. 目标还有标签位      → 整个分类搬过去成为新的独立标签页
+        ///      （连标签对象一起搬，条目与其来源记录都原样保留）
+        ///   3. 已达 MaxTabs 上限  → 条目并入最后一个分类
+        ///
+        /// 三条路径都保证条目不丢失 —— 优先保数据，其次才保结构。
+        /// </summary>
+        private static void MergeTabsPreserving(FenceBox src, FenceBox dst)
+        {
+            if (src == null || dst == null) return;
+
+            // ★ 必须先按原顺序归置好再搬。
+            // 倒序遍历 + 就地 RemoveAt 虽然索引安全，但会把源盒的分类顺序
+            // 整个反过来 —— 用户能直接看到标签页次序乱掉。
+            var toMerge = new List<KeyValuePair<FenceTab, FenceTab>>();   // 源 → 目标同名分类
+            var toMove = new List<FenceTab>();                            // 需要整体搬过去的
+
+            foreach (FenceTab st in src.Tabs)
+            {
+                FenceTab match = FindTab(dst, st.Title);
+                if (match != null) toMerge.Add(new KeyValuePair<FenceTab, FenceTab>(st, match));
+                else toMove.Add(st);
+            }
+
+            // 1. 同名分类：条目并入，重复跳过
+            foreach (KeyValuePair<FenceTab, FenceTab> kv in toMerge)
+            {
+                foreach (GroupItem it in kv.Key.Items)
+                    if (!ContainsPathInTab(kv.Value, it.FullPath))
+                        kv.Value.Items.Add(it);
+            }
+
+            // 2. 异名分类：按原顺序追加为独立标签页；位置不够的并入最后一个
+            int room = FenceBox.MaxTabs - dst.Tabs.Count;
+
+            for (int i = 0; i < toMove.Count; i++)
+            {
+                FenceTab st = toMove[i];
+
+                if (i < room)
+                {
+                    dst.Tabs.Add(st);
+                    continue;
+                }
+
+                // 上限兜底：并入最后一个分类，绝不丢条目
+                FenceTab last = dst.Tabs[dst.Tabs.Count - 1];
+                foreach (GroupItem it in st.Items)
+                    if (!ContainsPathInTab(last, it.FullPath))
+                        last.Items.Add(it);
+            }
+
+            // 3. 全部落地后才清空源盒 —— 保证中途异常也不会两头都没有
+            src.Tabs.Clear();
+        }
+
+        /// <summary>按标题找一个分类（忽略大小写，去空白）。找不到返回 null。</summary>
+        private static FenceTab FindTab(FenceBox box, string title)
+        {
+            if (box == null) return null;
+
+            string key = (title ?? string.Empty).Trim();
+
+            foreach (FenceTab t in box.Tabs)
+            {
+                if (string.Equals((t.Title ?? string.Empty).Trim(), key,
+                                  StringComparison.OrdinalIgnoreCase))
+                    return t;
+            }
+            return null;
+        }
+
+        /// <summary>某个分类内是否已含该路径。</summary>
+        private static bool ContainsPathInTab(FenceTab tab, string path)
+        {
+            if (tab == null || string.IsNullOrEmpty(path)) return false;
+
+            foreach (GroupItem it in tab.Items)
+                if (string.Equals(it.FullPath, path, StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+            return false;
+        }
+
+        /// <summary>
+        /// 整个盒（**所有**分类）内是否已含该路径。
+        ///
+        /// 与 ContainsPath 的区别：后者只看当前分类。多分类盒子做去重时必须全查，
+        /// 否则同一文件会在相邻标签页里出现两次。
+        /// </summary>
+        private static bool ContainsPathInBox(FenceBox box, string path)
+        {
+            if (box == null || string.IsNullOrEmpty(path)) return false;
+
+            foreach (FenceTab t in box.Tabs)
+                if (ContainsPathInTab(t, path)) return true;
+
+            return false;
         }
 
         // ============================================================
@@ -802,6 +982,16 @@ namespace DesktopIconManager.UI
             FenceBox src = _layout.Groups[srcIndex];
             FenceBox dst = _layout.Groups[dstIndex];
 
+            // 单盒锁定：组合会改变布局与归属，锁着的盒子请先解锁再操作
+            if (src.Locked || dst.Locked)
+            {
+                MessageBox.Show(this,
+                    "参与组合的收纳盒中有被锁定的（标题栏的锁）。\n" +
+                    "请先解锁再组合。",
+                    "已锁定", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return false;
+            }
+
             int free = FenceBox.MaxTabs - dst.Tabs.Count;
             if (free <= 0)
             {
@@ -823,6 +1013,13 @@ namespace DesktopIconManager.UI
                 "组合成格子组", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
 
             if (answer != DialogResult.Yes) return false;
+
+            // ★ 组合前先把两边各自的「独立形态」记下来 ——
+            // 一旦合进去，它们原来各自的位置与配置就无处可查，
+            // 「解散格子组」也就只能随便摆一排，回不到原处。
+            // 只补空缺不覆盖：连续组合多次时，第一次记的才是最初形态。
+            dst.CaptureOrigin();
+            src.CaptureOrigin();
 
             // 记录第一个新分类的下标，稍后切过去，让用户立刻看到结果
             int firstNew = dst.Tabs.Count;
@@ -913,7 +1110,13 @@ namespace DesktopIconManager.UI
             Render();
         }
 
-        /// <summary>把一个分类拆出来，成为独立的收纳盒。</summary>
+        /// <summary>
+        /// 把一个分类拆出来，成为独立的收纳盒。
+        ///
+        /// 有来源记录时**回到它合并前的原位置**，并还原当时的布局模式、
+        /// 锁定与折叠状态；没有记录（老存档、或该分类从未独立存在过）
+        /// 才退化成「放在源盒旁边」的自动排布。
+        /// </summary>
         private void DetachTab(int gi, int tabIndex)
         {
             if (gi < 0 || gi >= _layout.Groups.Count) return;
@@ -922,17 +1125,41 @@ namespace DesktopIconManager.UI
             if (box.Tabs.Count < 2) return;
             if (tabIndex < 0 || tabIndex >= box.Tabs.Count) return;
 
+            if (box.Locked)
+            {
+                MessageBox.Show(this,
+                    "这个收纳盒被锁定了（标题栏的锁）。\n请先解锁再拆分。",
+                    "已锁定", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
             FenceTab tab = box.Tabs[tabIndex];
 
-            var nb = new FenceBox();
-            nb.Tabs.Clear();
-            nb.Tabs.Add(tab);
-            // 放在源盒右侧并留出间距 —— 正好是吸附会认的贴合位置
-            nb.Bounds = new Rectangle(
-                box.Bounds.Right + _theme.PanelGap,
-                box.Bounds.Y,
-                box.Bounds.Width,
-                box.Bounds.Height);
+            // 优先按原边界还原
+            FenceBox nb = FenceBox.DetachToBox(tab);
+            bool restored = (nb != null);
+
+            if (nb == null)
+            {
+                int maxCols = AppSettings.Current.MaxColumns;
+                if (maxCols < 1) maxCols = 5;
+
+                Size sz = _renderer.MeasurePanelSize(
+                    Math.Max(1, tab.Items.Count), maxCols,
+                    _renderer.HeaderHeight(1), box.ViewMode);
+
+                nb = new FenceBox();
+                nb.Tabs.Clear();
+                nb.Tabs.Add(tab);
+                nb.ViewMode = box.ViewMode;     // 布局/锁定跟随源盒，别退回默认值
+                nb.Locked = box.Locked;
+                nb.ActiveTab = 0;
+                nb.Bounds = FindFreeSlot(box.Bounds, sz);
+            }
+            else
+            {
+                nb.Bounds = ClampPanelToScreen(nb.Bounds, SystemInformation.VirtualScreen);
+            }
 
             box.Tabs.RemoveAt(tabIndex);
             if (box.ActiveTab >= box.Tabs.Count) box.ActiveTab = box.Tabs.Count - 1;
@@ -940,10 +1167,79 @@ namespace DesktopIconManager.UI
             _layout.Groups.Add(nb);
 
             AutoFitPanel(gi);
-            AutoFitPanel(_layout.Groups.Count - 1);
+
+            int ngi = _layout.Groups.Count - 1;
+            if (restored)
+                EnsureTabFits(ngi);     // 原边界可能装不下现在的内容 → 只增不减地撑开
+            else
+                AutoFitPanel(ngi);
 
             MarkDirty();
             Render();
+        }
+
+        /// <summary>
+        /// 为「没有原始位置记录」的拆出盒找一个不与现有面板重叠的落位。
+        /// 依次尝试右侧 → 下方 → 左侧，都不行就交给重叠消除兜底。
+        /// </summary>
+        private Rectangle FindFreeSlot(Rectangle anchor, Size size)
+        {
+            int gap = _theme.PanelGap;
+            Rectangle screen = SystemInformation.VirtualScreen;
+
+            var candidates = new List<Rectangle>(3);
+            candidates.Add(new Rectangle(anchor.Right + gap, anchor.Y, size.Width, size.Height));
+            candidates.Add(new Rectangle(anchor.X, anchor.Bottom + gap, size.Width, size.Height));
+            candidates.Add(new Rectangle(anchor.Left - size.Width - gap, anchor.Y, size.Width, size.Height));
+
+            foreach (Rectangle c in candidates)
+            {
+                if (c.X < screen.X || c.Y < screen.Y) continue;
+                if (c.Right > screen.Right || c.Bottom > screen.Bottom) continue;
+                if (IntersectsAny(c)) continue;
+                return c;
+            }
+
+            // 实在没空位：先贴右侧放，随后由 ResolveOverlaps 推开
+            return new Rectangle(anchor.Right + gap, anchor.Y, size.Width, size.Height);
+        }
+
+        private bool IntersectsAny(Rectangle r)
+        {
+            foreach (FenceBox b in _layout.Groups)
+                if (b.Bounds.IntersectsWith(r)) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// 把面板拉回屏幕内。
+        ///
+        /// 还原出来的位置可能来自更早的分辨率（换显示器、改缩放后存档没更新），
+        /// 不夹一下面板会整个跑到屏幕外，变成看不见也点不到的幽灵盒。
+        /// </summary>
+        private static Rectangle ClampPanelToScreen(Rectangle r, Rectangle screen)
+        {
+            int w = Math.Min(r.Width, Math.Max(GroupLayout.MinPanelWidth, screen.Width - 16));
+            int h = Math.Min(r.Height, Math.Max(80, screen.Height - 16));
+
+            int x = r.X, y = r.Y;
+            if (x + w > screen.Right) x = screen.Right - w;
+            if (x < screen.Left) x = screen.Left;
+            if (y + h > screen.Bottom) y = screen.Bottom - h;
+            if (y < screen.Top) y = screen.Top;
+
+            return new Rectangle(x, y, w, h);
+        }
+
+        /// <summary>当前布局里是否存在任意两块面板相交。</summary>
+        private bool HasOverlap()
+        {
+            for (int i = 0; i < _layout.Groups.Count; i++)
+                for (int j = i + 1; j < _layout.Groups.Count; j++)
+                    if (_layout.Groups[i].Bounds.IntersectsWith(_layout.Groups[j].Bounds))
+                        return true;
+
+            return false;
         }
 
         /// <summary>解散一个分类；若它是最后一个，等同于解散整个收纳盒。</summary>
@@ -997,8 +1293,12 @@ namespace DesktopIconManager.UI
         /// <summary>
         /// 解散格子组：把该盒的每个分类还原成独立的收纳盒。
         ///
-        /// 这是「组合到…」的反操作。之前只能一个分类一个分类地拆，
-        /// 一旦误把多个面板组合起来就很难还原 —— 用户正是这么被坑的。
+        /// 这是「组合到…」的严格反操作 —— **按原边界拆分**：
+        /// 组合时记下了每个分类当时的位置、尺寸、布局模式、锁定 / 折叠状态，
+        /// 这里照单还原，每个分类回到合并前它自己站的地方，
+        /// 各自的布局与设置也随之恢复，而不是像从前那样统一重排成一排。
+        ///
+        /// 没有来源记录的老存档，退化成原来的自动排布（行为不变）。
         /// </summary>
         private void DissolveGroup(int gi)
         {
@@ -1013,14 +1313,32 @@ namespace DesktopIconManager.UI
                 return;
             }
 
+            if (src.Locked)
+            {
+                MessageBox.Show(this,
+                    "这个收纳盒被锁定了（标题栏的锁）。\n请先解锁再解散。",
+                    "已锁定", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
             int total = 0;
-            foreach (FenceTab t in src.Tabs) total += t.Items.Count;
+            int restorable = 0;
+
+            foreach (FenceTab t in src.Tabs)
+            {
+                total += t.Items.Count;
+                if (t.Origin != null && t.Origin.IsUsable) restorable++;
+            }
 
             var answer = MessageBox.Show(this,
                 "把「" + src.Title + "」的 " + src.Tabs.Count + " 个分类拆成 " +
                 src.Tabs.Count + " 个独立收纳盒？\n\n" +
                 "共 " + total + " 个条目会各自回到对应收纳盒。\n" +
-                "只调整面板归属，不会移动或删除任何文件。",
+                (restorable > 0
+                    ? "\n其中 " + restorable + " 个有原始位置记录，会回到合并前的原位，\n" +
+                      "并还原各自的布局 / 锁定 / 折叠设置。"
+                    : "\n（这些分类没有原始位置记录，将自动排布在原盒附近）") +
+                "\n\n只调整面板归属，不会移动或删除任何文件。",
                 "解散格子组", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
 
             if (answer != DialogResult.Yes) return;
@@ -1030,6 +1348,7 @@ namespace DesktopIconManager.UI
             int baseX = src.Bounds.X;
             int baseY = src.Bounds.Y;
             BoxViewMode view = src.ViewMode;
+            bool locked = src.Locked;
 
             int maxCols = AppSettings.Current.MaxColumns;
             if (maxCols < 1) maxCols = 5;
@@ -1040,42 +1359,69 @@ namespace DesktopIconManager.UI
             _layout.Groups.RemoveAt(gi);
 
             int x = baseX, y = baseY, rowH = 0;
+            int restored = 0;
+            int firstNew = _layout.Groups.Count;
 
             for (int i = 0; i < tabs.Count; i++)
             {
                 FenceTab tab = tabs[i];
 
-                Size sz = _renderer.MeasurePanelSize(
-                    Math.Max(1, tab.Items.Count), maxCols, singleHeader, view);
+                // ① 有来源记录 → 按原边界还原（含布局 / 锁定 / 折叠）
+                FenceBox nb = FenceBox.DetachToBox(tab);
 
-                if (x + sz.Width > screen.Right - 8 && x > baseX)
+                if (nb != null)
                 {
-                    x = baseX;
-                    y += rowH + _theme.PanelGap;
-                    rowH = 0;
+                    restored++;
+                }
+                else
+                {
+                    // ② 无记录 → 老行为：测量尺寸后从原盒位置起流式排布
+                    Size sz = _renderer.MeasurePanelSize(
+                        Math.Max(1, tab.Items.Count), maxCols, singleHeader, view);
+
+                    if (x + sz.Width > screen.Right - 8 && x > baseX)
+                    {
+                        x = baseX;
+                        y += rowH + _theme.PanelGap;
+                        rowH = 0;
+                    }
+
+                    nb = new FenceBox();
+                    nb.Tabs.Clear();
+                    nb.Tabs.Add(tab);
+                    nb.ViewMode = view;
+                    nb.Locked = locked;
+                    nb.ActiveTab = 0;
+                    nb.Bounds = new Rectangle(x, y, sz.Width, sz.Height);
+
+                    x += sz.Width + _theme.PanelGap;
+                    if (sz.Height > rowH) rowH = sz.Height;
                 }
 
-                var nb = new FenceBox();
-                nb.Tabs.Clear();
-                nb.Tabs.Add(tab);
-                nb.ViewMode = view;
-                nb.ActiveTab = 0;
-                nb.Bounds = new Rectangle(x, y, sz.Width, sz.Height);
+                // 还原出的位置可能来自旧分辨率 —— 夹回屏幕内，避免变成幽灵盒
+                nb.Bounds = ClampPanelToScreen(nb.Bounds, screen);
 
                 _layout.Groups.Add(nb);
-
-                x += sz.Width + _theme.PanelGap;
-                if (sz.Height > rowH) rowH = sz.Height;
             }
 
-            // 摆不稳就交给既有的重叠消除兜底
-            _layout.ResolveOverlaps(screen.Width);
+            // 还原后若与既有面板打架，只让「后来者」（刚拆出来的）让位，
+            // 既有的面板一个都不动 —— 与 ResolveOverlaps 的保守策略一致
+            if (HasOverlap()) _layout.ResolveOverlaps(screen.Width);
+
+            // 组合期间条目可能变多了，原边界装不下 —— 只增不减地撑开，
+            // 避免图标被裁掉；不够撑时也不会把面板缩回去
+            for (int i = firstNew; i < _layout.Groups.Count; i++)
+                EnsureTabFits(i);
 
             MarkDirty();
             Render();
 
             MessageBox.Show(this,
-                "已拆成 " + tabs.Count + " 个收纳盒。\n可直接拖标题栏重新摆放。",
+                "已拆成 " + tabs.Count + " 个收纳盒" +
+                (restored > 0
+                    ? "，其中 " + restored + " 个已回到合并前的原位置。"
+                    : "。") +
+                "\n可直接拖标题栏重新摆放。",
                 "解散完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
@@ -2569,14 +2915,24 @@ namespace DesktopIconManager.UI
 
                 if (box.Tabs.Count > 1)
                 {
+                    int at = Math.Max(0, Math.Min(box.ActiveTab, box.Tabs.Count - 1));
+
                     menu.Items.Add(new ToolStripSeparator());
-                    menu.Items.Add("解散格子组（拆成 " + box.Tabs.Count + " 个独立收纳盒）",
+
+                    // 有原始位置记录时明确告诉用户「会回到原位」，
+                    // 否则他无法预知拆出来会散到哪儿
+                    menu.Items.Add("解散格子组（拆成 " + box.Tabs.Count + " 个独立收纳盒" +
+                                   (box.HasUsableOrigin ? " · 回到原位" : "") + "）",
                         null, delegate { DissolveGroup(gi); });
+
                     menu.Items.Add(new ToolStripSeparator());
-                    menu.Items.Add("拆出当前分类为独立收纳盒",
-                        null, delegate { DetachTab(gi, box.ActiveTab); });
+
+                    bool restore = box.Tabs[at].Origin != null && box.Tabs[at].Origin.IsUsable;
+                    menu.Items.Add("拆出当前分类为独立收纳盒" + (restore ? "（回到原位）" : ""),
+                        null, delegate { DetachTab(gi, at); });
+
                     menu.Items.Add("解散当前分类",
-                        null, delegate { RemoveTab(gi, box.ActiveTab); });
+                        null, delegate { RemoveTab(gi, at); });
                 }
 
                 menu.Items.Add(new ToolStripSeparator());
@@ -2722,8 +3078,11 @@ namespace DesktopIconManager.UI
 
             if (box.Tabs.Count > 1)
             {
+                bool restore = box.Tabs[t].Origin != null && box.Tabs[t].Origin.IsUsable;
+
                 menu.Items.Add(new ToolStripSeparator());
-                menu.Items.Add("拆出为独立收纳盒", null, delegate { DetachTab(gi, t); });
+                menu.Items.Add("拆出为独立收纳盒" + (restore ? "（回到原位）" : ""),
+                    null, delegate { DetachTab(gi, t); });
                 menu.Items.Add("解散此分类", null, delegate { RemoveTab(gi, t); });
             }
 

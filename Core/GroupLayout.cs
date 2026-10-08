@@ -24,6 +24,56 @@ namespace DesktopIconManager.Core
     }
 
     /// <summary>
+    /// 一个分类在被组合进别的收纳盒之前，作为独立收纳盒时的几何与配置。
+    ///
+    /// 存在的意义只有一个：**让「拆分」能按原边界还原**。
+    /// 组合时把每个分类当时的位置、尺寸、布局模式、锁定 / 折叠状态记下来，
+    /// 拆开时照单还原；没有记录的分类（老存档、或建盒后从未参与组合的）
+    /// 退化为自动排布 —— 见 DesktopOverlayForm.DissolveGroup。
+    ///
+    /// 这是纯元数据，不参与渲染，也不影响命中测试。
+    /// </summary>
+    public sealed class TabOrigin
+    {
+        public Rectangle Bounds;
+        public BoxViewMode ViewMode;
+        public bool Locked;
+        public bool Collapsed;
+
+        public TabOrigin() { }
+
+        public TabOrigin(Rectangle bounds, BoxViewMode viewMode, bool locked, bool collapsed)
+        {
+            Bounds = bounds;
+            ViewMode = viewMode;
+            Locked = locked;
+            Collapsed = collapsed;
+        }
+
+        /// <summary>
+        /// 边界是否可用于还原。
+        ///
+        /// 存档是文本、可被手改，源头也可能是极端分辨率下的旧数据；
+        /// 宽高为负或荒谬大时宁可放弃还原，也不让面板跑到屏幕外。
+        /// </summary>
+        public bool IsUsable
+        {
+            get
+            {
+                if (Bounds.Width < GroupLayout.MinPanelWidth) return false;
+                if (Bounds.Height < 24) return false;
+                if (Bounds.Width > 20000 || Bounds.Height > 20000) return false;
+                return true;
+            }
+        }
+
+        public TabOrigin Clone()
+        {
+            return new TabOrigin(Bounds, ViewMode, Locked, Collapsed);
+        }
+    }
+
+    /// <summary>
     /// 收纳盒内的一个「分类」—— 也就是面板顶部的一个标签页。
     ///
     /// 每个分类各自持有一份条目列表，互不干扰；
@@ -33,6 +83,12 @@ namespace DesktopIconManager.Core
     {
         public string Title { get; set; }
         public List<GroupItem> Items { get; private set; }
+
+        /// <summary>
+        /// 该分类作为独立收纳盒时的原始几何与配置（用于组合后按原边界拆分）。
+        /// null = 无记录（拆开时改用自动排布）。
+        /// </summary>
+        public TabOrigin Origin { get; set; }
 
         public FenceTab()
         {
@@ -104,6 +160,67 @@ namespace DesktopIconManager.Core
             ViewMode = BoxViewMode.LargeIcons;
             Bounds = new Rectangle(24, 24, 320, 240);
             Collapsed = false;
+        }
+
+        /// <summary>
+        /// 为盒内还没有来源记录的分类记下**当前**的几何与配置。
+        ///
+        /// 必须在「把别的盒组合进来」或「本盒被组合进别的盒」之前调用：
+        /// 一旦组合完成，原来各自独立时的位置就没处可查了。
+        ///
+        /// 只补空缺、不覆盖已有记录 —— 同一个盒被连续组合多次时，
+        /// 第一次记下的才是它最初的独立形态。
+        /// </summary>
+        public int CaptureOrigin()
+        {
+            int captured = 0;
+            Rectangle b = Bounds;
+
+            foreach (FenceTab t in Tabs)
+            {
+                if (t.Origin != null) continue;
+                t.Origin = new TabOrigin(b, ViewMode, Locked, Collapsed);
+                captured++;
+            }
+
+            return captured;
+        }
+
+        /// <summary>是否存在可用于「按原边界拆分」的来源记录。</summary>
+        public bool HasUsableOrigin
+        {
+            get
+            {
+                foreach (FenceTab t in Tabs)
+                    if (t.Origin != null && t.Origin.IsUsable) return true;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 按来源记录构造一个独立收纳盒（用于拆分）。
+        ///
+        /// 没有记录或记录不可用时返回 null，由调用方退化为自动排布。
+        /// </summary>
+        public static FenceBox DetachToBox(FenceTab tab)
+        {
+            if (tab == null) return null;
+            if (tab.Origin == null || !tab.Origin.IsUsable) return null;
+
+            var box = new FenceBox();
+            box.Tabs.Clear();
+            box.Tabs.Add(tab);
+            box.Bounds = tab.Origin.Bounds;
+            box.ViewMode = tab.Origin.ViewMode;
+            box.Locked = tab.Origin.Locked;
+            box.Collapsed = tab.Origin.Collapsed;
+            box.ActiveTab = 0;
+
+            // 已还原成独立盒，来源记录不再有意义 —— 清掉，
+            // 否则下次再组合时会拿这份旧记录覆盖掉它真正的新位置。
+            tab.Origin = null;
+
+            return box;
         }
 
         /// <summary>
@@ -310,7 +427,23 @@ namespace DesktopIconManager.Core
 
                 foreach (FenceTab tab in g.Tabs)
                 {
-                    sb.Append("T\t").Append(Escape(tab.Title)).Append("\r\n");
+                    sb.Append("T\t").Append(Escape(tab.Title));
+
+                    // 尾部来源是**可选**的：没有记录时这行与旧版本逐字节一致，
+                    // 老 exe 也能照常读（多出的字段被忽略）。
+                    TabOrigin o = tab.Origin;
+                    if (o != null && o.IsUsable)
+                    {
+                        sb.Append('\t').Append(o.Bounds.X)
+                          .Append('\t').Append(o.Bounds.Y)
+                          .Append('\t').Append(o.Bounds.Width)
+                          .Append('\t').Append(o.Bounds.Height)
+                          .Append('\t').Append((int)o.ViewMode)
+                          .Append('\t').Append(o.Locked ? "1" : "0")
+                          .Append('\t').Append(o.Collapsed ? "1" : "0");
+                    }
+
+                    sb.Append("\r\n");
 
                     foreach (GroupItem it in tab.Items)
                     {
@@ -394,7 +527,42 @@ namespace DesktopIconManager.Core
                 else if (p[0] == "T" && p.Length >= 2 && box != null)
                 {
                     if (box.Tabs.Count >= FenceBox.MaxTabs) continue;
-                    box.Tabs.Add(new FenceTab(Unescape(p[1])));
+
+                    FenceTab tab = new FenceTab(Unescape(p[1]));
+
+                    // 可选字段：本分类被组合前的原始几何与配置。
+                    // 老存档没有这段 → 保持 null，拆开时退化为自动排布。
+                    // 只要有完整边界（6 列）就先认下来，后三列各自缺省，
+                    // 这样手改过或只写了一半的存档也不会整段失效。
+                    if (p.Length >= 6)
+                    {
+                        int ox, oy, ow, oh, ov;
+                        if (int.TryParse(p[2], out ox) &&
+                            int.TryParse(p[3], out oy) &&
+                            int.TryParse(p[4], out ow) &&
+                            int.TryParse(p[5], out oh))
+                        {
+                            // 字段序号（从 0 起）：
+                            //   0=T  1=标题  2..5=边界  6=布局  7=锁定  8=折叠
+                            // 判定一律用「该位是否存在」= index + 1。
+                            // 写成 >=10 / >=11 这类偏大的值会让后两位永远读不到 ——
+                            // 表现是「拆回去后锁定/折叠状态丢了」，很难查。
+                            ov = 0;
+                            if (p.Length >= 7) int.TryParse(p[6], out ov);
+
+                            BoxViewMode vm = (ov == 1) ? BoxViewMode.SmallIcons
+                                           : (ov == 2) ? BoxViewMode.List
+                                           : BoxViewMode.LargeIcons;
+
+                            bool oLock = p.Length >= 8 && p[7] == "1";
+                            bool oCol = p.Length >= 9 && p[8] == "1";
+
+                            var o = new TabOrigin(new Rectangle(ox, oy, ow, oh), vm, oLock, oCol);
+                            if (o.IsUsable) tab.Origin = o;
+                        }
+                    }
+
+                    box.Tabs.Add(tab);
                 }
                 else if (p[0] == "I" && p.Length >= 4 && box != null)
                 {
