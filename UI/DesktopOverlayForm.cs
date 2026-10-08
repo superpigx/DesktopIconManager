@@ -33,7 +33,7 @@ namespace DesktopIconManager.UI
     /// </summary>
     internal sealed class DesktopOverlayForm : Form
     {
-        private enum DragMode { None, Panel, Item, Resize }
+        private enum DragMode { None, Panel, Item, Resize, Tab }
 
         /// <summary>
         /// 右下角缩放手柄的命中边长。
@@ -41,6 +41,14 @@ namespace DesktopIconManager.UI
         /// 命中区略大于视觉区一点点（14 vs 13），手感更「好点」。
         /// </summary>
         private const int ResizeGrip = 14;
+
+        /// <summary>
+        /// 拖动阈值：位移小于它就当成「点击」，不进入拖拽。
+        ///
+        /// 标签既要能点（切换分类）又要能拖（调整顺序），
+        /// 没有阈值的话手一抖就变成排序，想切换反而切不动。
+        /// </summary>
+        private const int DragThreshold = 5;
 
         private ThemePalette _theme;
         private GroupPanelRenderer _renderer;
@@ -53,6 +61,23 @@ namespace DesktopIconManager.UI
         private int _dragItem = -1;
         private Point _dragStart;
         private Rectangle _dragOriginRect;
+
+        // ---- 分类标签拖拽排序 ----
+        /// <summary>正被拖动的分类下标，-1 表示无。</summary>
+        private int _dragTab = -1;
+        /// <summary>是否已越过拖动阈值（未越过 = 只是一次点击）。</summary>
+        private bool _dragMoved;
+        /// <summary>松手后会插入到哪个槽位（0..Tabs.Count）。</summary>
+        private int _tabDropIndex = -1;
+
+        // ---- 标题栏按钮的悬停与提示 ----
+        /// <summary>鼠标压在哪个盒的哪个标题栏按钮上（0=锁，1=视图）。</summary>
+        private int _hoverBtnGroup = -1;
+        private int _hoverBtn = -1;
+        /// <summary>按钮说明气泡：延迟弹出，避免鼠标一扫就闪。</summary>
+        private Timer _tipTimer;
+        private string _tipText;
+        private Rectangle _tipAnchor;
 
         private readonly SnapEngine _snap = new SnapEngine();
 
@@ -195,6 +220,19 @@ namespace DesktopIconManager.UI
                 _saveTimer = null;
             }
 
+            // 标题栏按钮说明气泡：悬停 450ms 后才弹，
+            // 鼠标只是扫过时不会闪出一堆提示。
+            try
+            {
+                _tipTimer = new Timer();
+                _tipTimer.Interval = 450;
+                _tipTimer.Tick += OnTipTimerTick;
+            }
+            catch
+            {
+                _tipTimer = null;
+            }
+
             // 接管桌面：先隐藏系统图标，避免与自绘图标重叠
             DesktopToggler.HideIcons();
 
@@ -235,6 +273,52 @@ namespace DesktopIconManager.UI
         {
             if (_saveTimer != null) _saveTimer.Stop();
             SaveIfDirty();
+        }
+
+        /// <summary>某个标题栏按钮的说明文字（跟随锁定状态实时变化）。</summary>
+        private static string TitleTipText(FenceBox box, int button)
+        {
+            if (button == 0)
+                return box.Locked ? "已锁定：不能拖动 / 缩放 · 点击解锁"
+                                  : "点击锁定：禁止拖动与缩放";
+            return "切换显示方式：大图标 → 小图标 → 列表";
+        }
+
+        /// <summary>
+        /// 说明气泡到点弹出。气泡可能伸出面板之外，
+        /// 所以这里走整屏重绘 —— 脏矩形只覆盖面板范围，会留残影。
+        /// </summary>
+        private void OnTipTimerTick(object sender, EventArgs e)
+        {
+            if (_tipTimer != null) _tipTimer.Stop();
+
+            if (_hoverBtn < 0 || _hoverBtnGroup < 0
+                || _hoverBtnGroup >= _layout.Groups.Count)
+            {
+                HideTip();
+                return;
+            }
+
+            FenceBox box = _layout.Groups[_hoverBtnGroup];
+            string text = TitleTipText(box, _hoverBtn);
+            if (_tipText == text) return;
+
+            _tipAnchor = GroupPanelRenderer.TitleButtonRect(
+                ToLocal(box.Bounds), _theme.TitleHeight, _hoverBtn);
+            _tipText = text;
+            Render();
+        }
+
+        /// <summary>隐藏气泡。返回是否真的重绘过（调用方可据此跳过重复渲染）。</summary>
+        private bool HideTip()
+        {
+            if (_tipTimer != null) { try { _tipTimer.Stop(); } catch { } }
+            if (_tipText == null) return false;
+
+            _tipText = null;
+            _tipAnchor = Rectangle.Empty;
+            Render();
+            return true;
         }
 
         /// <summary>标记布局已改动，并按去抖设置安排落盘。</summary>
@@ -1788,10 +1872,21 @@ namespace DesktopIconManager.UI
                 int hoverTab = (gi == _hoverGroup) ? _hoverTab : -1;
 
                 _renderer.DrawPanel(g, bounds, box.Title, box.Items.Count,
-                                    TabTitlesOf(box), box.ActiveTab, hoverTab);
+                                    TabTitlesOf(box), box.ActiveTab, hoverTab, box.Locked);
 
-                // 标题栏按钮（锁 / 视图切换）—— 折叠时也画，标题栏还在
-                _renderer.DrawTitleButtons(g, bounds, box.Locked);
+                // 标题栏按钮（锁 / 视图切换）—— 折叠时也画，标题栏还在。
+                // hoverBtn：悬停的按钮有底衬反馈，「能不能点」不用猜
+                int hoverBtn = (gi == _hoverBtnGroup) ? _hoverBtn : -1;
+                _renderer.DrawTitleButtons(g, bounds, box.Locked, hoverBtn);
+
+                // 拖拽排序中：在被拖标签与落点槽位上画反馈
+                if (_drag == DragMode.Tab && _dragMoved && gi == _dragGroup
+                    && !box.Collapsed && box.Tabs.Count > 1)
+                {
+                    Rectangle[] rects = _renderer.GetTabRects(bounds, box.Tabs.Count);
+                    if (rects != null && rects.Length == box.Tabs.Count)
+                        _renderer.DrawTabReorderMark(g, rects, _dragTab, _tabDropIndex);
+                }
 
                 if (box.Collapsed) continue;
 
@@ -1900,6 +1995,10 @@ namespace DesktopIconManager.UI
             // 参考线画在最上层 —— 拖动时能看见正在跟谁对齐
             if (_dragGuides.Count > 0)
                 _renderer.DrawSnapGuides(g, _dragGuides, _origin);
+
+            // 按钮说明气泡画在一切之上（可能伸出面板，所以放最后）
+            if (!string.IsNullOrEmpty(_tipText))
+                _renderer.DrawTip(g, _tipText, _tipAnchor, view);
         }
 
         /// <summary>
@@ -2271,7 +2370,7 @@ namespace DesktopIconManager.UI
                 try { Focus(); } catch { }
             }
 
-            // 分类标签：左键切换 / 右键出菜单
+            // 分类标签：左键切换（并可顺势拖动调整顺序）/ 右键出菜单
             int tg, tt;
             if (HitTab(e.Location, out tg, out tt))
             {
@@ -2282,7 +2381,23 @@ namespace DesktopIconManager.UI
                 }
                 if (e.Button == MouseButtons.Left)
                 {
-                    if (tt >= 0) SwitchTab(tg, tt);
+                    if (tt >= 0)
+                    {
+                        SwitchTab(tg, tt);   // 点一下就切，不用等松手
+
+                        // 顺手进入「可拖」状态：真拖起来要越过阈值才算，
+                        // 所以普通的点击不会被误判成排序。
+                        // 单盒锁定时结构冻结 —— 切换照常，排序不行
+                        if (!_layout.Groups[tg].Locked)
+                        {
+                            _drag = DragMode.Tab;
+                            _dragGroup = tg;
+                            _dragTab = tt;
+                            _dragStart = e.Location;
+                            _dragMoved = false;
+                            _tabDropIndex = tt;
+                        }
+                    }
                     else ShowTabList(tg, e.Location);   // 紧凑模式：弹列表
                     return;
                 }
@@ -2328,6 +2443,13 @@ namespace DesktopIconManager.UI
                     // 循环切换：大图标 → 小图标 → 列表 → 大图标
                     bb.ViewMode = (BoxViewMode)(((int)bb.ViewMode + 1) % 3);
                     AutoFitPanel(bgi);
+                }
+
+                // 气泡正开着时，文字要立刻跟着状态变 ——
+                // 「点了没反应」的很大一部分就是这里没刷新
+                if (_tipText != null && _hoverBtnGroup == bgi)
+                {
+                    _tipText = TitleTipText(bb, bbtn);
                 }
 
                 MarkDirty();
@@ -2391,6 +2513,13 @@ namespace DesktopIconManager.UI
             _hoverItem = -1;
             _hoverTab = -1;
             _hoverGrip = -1;
+            _hoverBtnGroup = -1;
+            _hoverBtn = -1;
+
+            // 气泡随悬停一起消失；后面反正要 Render，不用 HideTip 的整屏重绘
+            if (_tipTimer != null) { try { _tipTimer.Stop(); } catch { } }
+            _tipText = null;
+            _tipAnchor = Rectangle.Empty;
 
             UpdateCursor();
             Render();
@@ -2463,11 +2592,106 @@ namespace DesktopIconManager.UI
             {
                 UpdateHover(e.Location);
             }
+            else if (_drag == DragMode.Tab && _dragGroup >= 0)
+            {
+                // 标签排序：越过阈值才算真的在拖，
+                // 「按住想切换但手滑了一两像素」不会误触发
+                if (!_dragMoved)
+                {
+                    int ddx = e.X - _dragStart.X;
+                    int ddy = e.Y - _dragStart.Y;
+                    if (Math.Abs(ddx) + Math.Abs(ddy) < DragThreshold) return;
+
+                    _dragMoved = true;
+                    HideTip();
+                }
+
+                int at = TabDropIndexAt(e.Location);
+                if (at != _tabDropIndex)
+                {
+                    _tabDropIndex = at;
+
+                    // 插入指示画在标签行内 —— 只重绘源盒就够了
+                    if (_dragGroup < _layout.Groups.Count)
+                        RenderRegion(InflatedLocal(_layout.Groups[_dragGroup].Bounds));
+                }
+            }
+        }
+
+        /// <summary>
+        /// 根据鼠标位置算出标签应插入的槽位（0..Tabs.Count）。
+        ///
+        /// 判定用「鼠标在标签中点的左边还是右边」，
+        /// 返回的是**原序列**里的插入槽，MoveTab 时再做移除偏移。
+        /// 紧凑模式（并排放不下）返回 -1：整条是一块，没法逐个定位。
+        /// </summary>
+        private int TabDropIndexAt(Point p)
+        {
+            if (_dragGroup < 0 || _dragGroup >= _layout.Groups.Count) return -1;
+
+            FenceBox box = _layout.Groups[_dragGroup];
+            Rectangle[] rects = _renderer.GetTabRects(ToLocal(box.Bounds), box.Tabs.Count);
+            if (rects == null || rects.Length != box.Tabs.Count) return -1;
+
+            for (int i = 0; i < rects.Length; i++)
+            {
+                if (p.X < rects[i].Left + rects[i].Width / 2) return i;
+            }
+
+            return rects.Length;   // 中点都在鼠标左边 → 插到末尾
+        }
+
+        /// <summary>把分类从 from 移到插入槽 insertAt（0..Tabs.Count），当前分类跟着走。</summary>
+        private void ReorderTab(int gi, int from, int insertAt)
+        {
+            if (gi < 0 || gi >= _layout.Groups.Count) return;
+
+            FenceBox box = _layout.Groups[gi];
+            if (from < 0 || from >= box.Tabs.Count) return;
+            if (insertAt < 0 || insertAt > box.Tabs.Count) return;
+            if (insertAt == from || insertAt == from + 1) return;   // 原位
+            if (box.Locked)
+            {
+                MessageBox.Show(this,
+                    "这个收纳盒被锁定了（标题栏的锁）。\n请先解锁再调整分类顺序。",
+                    "已锁定", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            FenceTab tab = box.Tabs[from];
+            box.Tabs.RemoveAt(from);
+
+            // 槽位是按「移除前」的序列给的，源在目标左侧时要往回收一格
+            int at = (insertAt > from) ? insertAt - 1 : insertAt;
+            if (at < 0) at = 0;
+            if (at > box.Tabs.Count) at = box.Tabs.Count;
+            box.Tabs.Insert(at, tab);
+
+            box.ActiveTab = at;   // 拖的就是当前分类，落定后它仍是当前
+            MarkDirty();
+            Render();
         }
 
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+
+            // 标签排序：真拖动了才重排 —— 没越过阈值就只是一次普通的「点击切换」
+            if (_drag == DragMode.Tab)
+            {
+                if (_dragMoved && _dragGroup >= 0 && _dragTab >= 0 && _tabDropIndex >= 0)
+                {
+                    ReorderTab(_dragGroup, _dragTab, _tabDropIndex);
+
+                    // 原位松手也要把拖拽高亮刷掉
+                    if (_dragGroup < _layout.Groups.Count)
+                        RenderRegion(InflatedLocal(_layout.Groups[_dragGroup].Bounds));
+                }
+
+                _dragTab = -1;
+                _dragMoved = false;
+                _tabDropIndex = -1;
+            }
 
             // 拖面板标题栏落到另一个面板的**头部**上 → 组合成格子组（不是合并条目）
             if (_drag == DragMode.Panel && _dragGroup >= 0)
@@ -2781,40 +3005,56 @@ namespace DesktopIconManager.UI
             int newItem = -1;
             int newTab = -1;
             int newGrip = -1;
+            int newBtnGroup = -1;
+            int newBtn = -1;
 
-            // 缩放手柄的优先级最高，必须与 OnMouseDown 的判断顺序一致 ——
-            // 顺序不一致就会出现「高亮在图标上、按下去却开始缩放」
-            int gripIndex;
-            if (!_locked && HitResizeGrip(p, out gripIndex))
+            // 标题栏按钮的优先级最高 —— 与 OnMouseDown 的判断顺序一致，
+            // 否则会出现「高亮在按钮上、按下去却是拖面板」。
+            // 全局锁定时按钮点不了，就不给任何「能点」的暗示（与 OnMouseDown 一致）
+            int bg, bb;
+            if (!_locked && HitTitleButton(p, out bg, out bb))
             {
-                newGrip = gripIndex;
-                newGroup = gripIndex;
+                newBtnGroup = bg;
+                newBtn = bb;
+                newGroup = bg;
             }
             else
             {
-                int gi, ii;
-                if (HitItem(p, out gi, out ii))
+                // 缩放手柄次之，同样要与 OnMouseDown 的顺序一致 ——
+                // 顺序不一致就会出现「高亮在图标上、按下去却开始缩放」
+                int gripIndex;
+                if (!_locked && HitResizeGrip(p, out gripIndex))
                 {
-                    newGroup = gi;
-                    newItem = ii;
+                    newGrip = gripIndex;
+                    newGroup = gripIndex;
                 }
                 else
                 {
-                    // 没落在条目上时也记录所在收纳盒 ——
-                    // 标签悬停高亮、滚轮与 Ctrl+Tab 切换都需要知道正对着哪个盒子
-                    newGroup = HitGroupBody(p);
-                }
+                    int gi, ii;
+                    if (HitItem(p, out gi, out ii))
+                    {
+                        newGroup = gi;
+                        newItem = ii;
+                    }
+                    else
+                    {
+                        // 没落在条目上时也记录所在收纳盒 ——
+                        // 标签悬停高亮、滚轮与 Ctrl+Tab 切换都需要知道正对着哪个盒子
+                        newGroup = HitGroupBody(p);
+                    }
 
-                int tg, tt;
-                if (HitTab(p, out tg, out tt))
-                {
-                    newGroup = tg;
-                    newTab = tt;   // 紧凑模式为 -1（整条一块，无法逐个高亮）
+                    int tg, tt;
+                    if (HitTab(p, out tg, out tt))
+                    {
+                        newGroup = tg;
+                        newTab = tt;   // 紧凑模式为 -1（整条一块，无法逐个高亮）
+                    }
                 }
             }
 
             bool changed = (newGroup != _hoverGroup || newItem != _hoverItem
-                            || newTab != _hoverTab || newGrip != _hoverGrip);
+                            || newTab != _hoverTab || newGrip != _hoverGrip
+                            || newBtn != _hoverBtn || newBtnGroup != _hoverBtnGroup);
 
             int prevGroup = _hoverGroup;
 
@@ -2823,11 +3063,38 @@ namespace DesktopIconManager.UI
             _hoverTab = newTab;
             _hoverGrip = newGrip;
 
+            bool btnChanged = (newBtn != _hoverBtn || newBtnGroup != _hoverBtnGroup);
+            _hoverBtnGroup = newBtnGroup;
+            _hoverBtn = newBtn;
+
+            // 按钮说明气泡：进入按钮才启动计时，扫过不闪
+            bool tipRendered = false;
+            if (btnChanged)
+            {
+                if (_hoverBtn >= 0)
+                {
+                    if (_tipTimer != null)
+                    {
+                        try
+                        {
+                            _tipTimer.Stop();
+                            _tipTimer.Start();
+                        }
+                        catch { }
+                    }
+                }
+                else
+                {
+                    tipRendered = HideTip();
+                }
+            }
+
             UpdateCursor();
 
             // 悬停变化只影响「离开的盒子」与「进入的盒子」——
-            // 之前是整屏重绘，1080p 下每划过一次鼠标就是 8MB 拷贝 + 207 万像素预乘
-            if (changed) RenderHoverFrame(prevGroup, newGroup);
+            // 之前是整屏重绘，1080p 下每划过一次鼠标就是 8MB 拷贝 + 207 万像素预乘。
+            // HideTip 已经整屏重绘过（气泡可能伸出面板），这里就不必再来一次。
+            if (changed && !tipRendered) RenderHoverFrame(prevGroup, newGroup);
         }
 
         /// <summary>
@@ -2849,9 +3116,15 @@ namespace DesktopIconManager.UI
             {
                 wanted = Cursors.SizeNWSE;
             }
-            else if (_drag == DragMode.Panel || _drag == DragMode.Item)
+            else if (_drag == DragMode.Panel || _drag == DragMode.Item
+                     || _drag == DragMode.Tab)
             {
                 wanted = Cursors.SizeAll;
+            }
+            else if (_hoverBtn >= 0)
+            {
+                // 标题栏按钮是「可点」的，用手型指针明确告诉用户
+                wanted = Cursors.Hand;
             }
             else if (_hoverGrip >= 0)
             {
@@ -3076,6 +3349,34 @@ namespace DesktopIconManager.UI
             menu.Items.Add("重命名此分类", null, delegate { RenameTab(gi, t); });
             menu.Items.Add("新建分类", null, delegate { AddTab(gi); });
 
+            // 顺序调整的菜单入口 —— 紧凑模式下标签是一整条没法拖，
+            // 以及不想拖的用户也能在这里调
+            if (box.Tabs.Count > 1)
+            {
+                menu.Items.Add(new ToolStripSeparator());
+
+                ToolStripMenuItem mv;
+                mv = new ToolStripMenuItem("← 左移一位");
+                mv.Enabled = (t > 0);
+                mv.Click += delegate { ReorderTab(gi, t, t - 1); };
+                menu.Items.Add(mv);
+
+                mv = new ToolStripMenuItem("→ 右移一位");
+                mv.Enabled = (t < box.Tabs.Count - 1);
+                mv.Click += delegate { ReorderTab(gi, t, t + 2); };
+                menu.Items.Add(mv);
+
+                mv = new ToolStripMenuItem("移到最前");
+                mv.Enabled = (t > 0);
+                mv.Click += delegate { ReorderTab(gi, t, 0); };
+                menu.Items.Add(mv);
+
+                mv = new ToolStripMenuItem("移到最后");
+                mv.Enabled = (t < box.Tabs.Count - 1);
+                mv.Click += delegate { ReorderTab(gi, t, box.Tabs.Count); };
+                menu.Items.Add(mv);
+            }
+
             if (box.Tabs.Count > 1)
             {
                 bool restore = box.Tabs[t].Origin != null && box.Tabs[t].Origin.IsUsable;
@@ -3245,6 +3546,7 @@ namespace DesktopIconManager.UI
             {
                 if (_hoverTimer != null) { _hoverTimer.Dispose(); _hoverTimer = null; }
                 if (_saveTimer != null) { _saveTimer.Dispose(); _saveTimer = null; }
+                if (_tipTimer != null) { _tipTimer.Dispose(); _tipTimer = null; }
                 if (_renderer != null) _renderer.Dispose();
                 if (_icons != null) _icons.Dispose();
 

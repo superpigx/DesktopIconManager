@@ -280,7 +280,8 @@ namespace DesktopIconManager.UI
         /// <param name="activeTab">当前分类索引。</param>
         /// <param name="hoverTab">鼠标悬停的分类索引，-1 表示无。</param>
         public void DrawPanel(Graphics g, Rectangle bounds, string title, int itemCount,
-                              string[] tabTitles, int activeTab, int hoverTab)
+                              string[] tabTitles, int activeTab, int hoverTab,
+                              bool locked = false)
         {
             if (_disposed || g == null) return;
             if (bounds.Width <= 0 || bounds.Height <= 0) return;
@@ -361,10 +362,20 @@ namespace DesktopIconManager.UI
                 }
             }
 
+            // ---- 4b. 锁定标记（标题栏最左端）----
+            // 右上角的锁按钮太小，扫一眼桌面看不出哪个盒被锁了；
+            // 这里再放一个，标题文字相应右移，不互相压。
+            int titleLeft = 10;
+            if (locked)
+            {
+                DrawLockBadge(g, titleRect);
+                titleLeft = 22;
+            }
+
             // ---- 4c. 标题文字 ----
             Rectangle titleTextRect = new Rectangle(
-                titleRect.X + 10, titleRect.Y,
-                Math.Max(1, titleRect.Width - 52), titleRect.Height);
+                titleRect.X + titleLeft, titleRect.Y,
+                Math.Max(1, titleRect.Width - 42 - titleLeft), titleRect.Height);
 
             using (var brush = new SolidBrush(_theme.TitleText))
             {
@@ -803,22 +814,31 @@ namespace DesktopIconManager.UI
         {
             const int badge = 24;   // 计数徽标占位
             const int gap = 4;
-            const int size = 18;
+            const int size = 20;
+            const int h = 18;
 
-            int y = bounds.Y + Math.Max(0, (titleHeight - 16) / 2);
+            int y = bounds.Y + Math.Max(0, (titleHeight - h) / 2);
             int right = bounds.Right - 8 - badge - gap;
 
-            // 从右往左：徽标 → 锁 → 列表
-            if (index == 0) return new Rectangle(right - size, y, size, 16);
-            return new Rectangle(right - gap - size * 2, y, size, 16);
+            // 从右往左：徽标 → 锁 → 列表。
+            // 18×16 太小：视觉上分辨不出闭合/开启的锁梁，点也容易点空，
+            // 所以统一放大到 20×18（命中与绘制共用同一矩形，不会漂移）。
+            if (index == 0) return new Rectangle(right - size, y, size, h);
+            return new Rectangle(right - gap - size * 2, y, size, h);
         }
 
         /// <summary>
         /// 画标题栏右侧的两个按钮：锁定（挂锁）与视图循环切换（三横线）。
         /// 对应原版收纳盒标题栏的 🔒 / ☰。
-        /// 锁定中的锁用主色 —— 绿依旧只作描边/强调。
+        ///
+        /// 锁必须「一眼看出是锁着还是开着」—— 只换颜色是不够的，
+        /// 所以两种状态画的是两种**形状**：
+        ///   · 锁定：锁体实心填充 + 完整半圆锁梁（梁的两脚都扣进锁体）
+        ///   · 未锁：锁体空心 + 锁梁抬起并向右偏（梁与锁体是分开的）
+        /// 再叠一层主色底衬与悬停底衬，让「有没有锁」「能不能点」都有反馈。
         /// </summary>
-        public void DrawTitleButtons(Graphics g, Rectangle bounds, bool locked)
+        /// <param name="hoverButton">鼠标压在哪个按钮上（0=锁，1=视图），-1 表示无。</param>
+        public void DrawTitleButtons(Graphics g, Rectangle bounds, bool locked, int hoverButton)
         {
             if (_disposed || g == null) return;
             if (bounds.Width < 130) return;   // 太窄放不下，硬画会压到标题文字
@@ -830,32 +850,207 @@ namespace DesktopIconManager.UI
                 Rectangle r = TitleButtonRect(bounds, _theme.TitleHeight, i);
                 if (r.IsEmpty) continue;
 
-                Color c = (i == 0 && locked) ? _theme.Accent : _theme.TitleText;
+                bool hot = (i == hoverButton);
+                bool lockOn = (i == 0 && locked);
 
-                using (var pen = new Pen(Color.FromArgb(0xB4, c), 1.6f))
+                // ---- 底衬 ----
+                // 锁定：主色实底（最显眼，远远就能看出这个盒被锁了）
+                // 悬停：中性淡底（说明这里能点）
+                Color back = Color.Empty;
+                if (lockOn) back = Color.FromArgb(0xE8, _theme.Accent);
+                else if (hot) back = Color.FromArgb(0x30, _theme.TitleText);
+
+                if (back.A > 0)
+                {
+                    using (var brush = new SolidBrush(back))
+                    {
+                        FillRoundedRect(g, brush, r, 3);
+                    }
+                }
+
+                // ---- 前景色 ----
+                // 锁定时要保证与主色底的对比度：主色偏亮就用深字，偏暗就用白字
+                Color ink;
+                if (lockOn) ink = IsLight(_theme.Accent) ? Color.FromArgb(0xFF, 0x18, 0x1C, 0x20)
+                                                         : Color.FromArgb(0xFF, 0xFF, 0xFF, 0xFF);
+                else ink = hot ? _theme.TitleText : Color.FromArgb(0xC4, _theme.TitleText);
+
+                using (var pen = new Pen(ink, 1.6f))
                 {
                     pen.StartCap = LineCap.Round;
                     pen.EndCap = LineCap.Round;
 
-                    if (i == 0)
-                    {
-                        // 挂锁：锁体 + 锁梁
-                        int bw = 8;
-                        int bx = r.X + (r.Width - bw) / 2;
-                        int by = r.Y + 7;
-                        g.DrawRectangle(pen, bx, by, bw, 6);
-                        g.DrawArc(pen, bx + 2, by - 5, 4, 6, 180, 180);
-                    }
+                    if (i == 0) DrawLockGlyph(g, pen, r, locked);
                     else
                     {
                         // 视图切换：三条横线
                         for (int k = 0; k < 3; k++)
                         {
-                            int ly = r.Y + 3 + k * 5;
-                            g.DrawLine(pen, r.X + 3, ly, r.X + r.Width - 3, ly);
+                            int ly = r.Y + 4 + k * 5;
+                            g.DrawLine(pen, r.X + 4, ly, r.X + r.Width - 4, ly);
                         }
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// 挂锁图形。锁定 = 实心锁体 + 扣紧的锁梁；未锁 = 空心锁体 + 抬起并右偏的锁梁。
+        /// 两种状态形状不同，颜色之外还能靠轮廓区分（色弱/小尺寸下也认得出）。
+        /// </summary>
+        private void DrawLockGlyph(Graphics g, Pen pen, Rectangle r, bool locked)
+        {
+            int bw = 10;
+            int bx = r.X + (r.Width - bw) / 2;
+            int by = r.Y + r.Height - 9;   // 锁体贴着按钮下沿，上方留给锁梁
+
+            if (locked)
+            {
+                // 锁梁：完整半圆，两脚垂直落进锁体 —— 「扣上了」
+                g.DrawArc(pen, bx + 1, by - 7, bw - 2, 9, 180, 180);
+
+                // 锁体：填实心，一眼就是「锁住了」
+                using (var brush = new SolidBrush(pen.Color))
+                {
+                    g.FillRectangle(brush, bx, by, bw, 7);
+                }
+            }
+            else
+            {
+                // 锁梁：向右上方抬起、只画到 150°，右侧一脚离开锁体 —— 「打开了」
+                g.DrawArc(pen, bx + 4, by - 8, bw - 2, 9, 178, 150);
+
+                // 锁体：空心
+                g.DrawRectangle(pen, bx, by, bw, 7);
+            }
+        }
+
+        /// <summary>颜色是否偏亮（用于在有色底上选黑字还是白字）。</summary>
+        private static bool IsLight(Color c)
+        {
+            return (c.R * 299 + c.G * 587 + c.B * 114) / 1000 >= 150;
+        }
+
+        /// <summary>
+        /// 标题栏左端的小锁标记 —— 锁定时才有。
+        ///
+        /// 光靠右上角按钮，扫一眼桌面看不出哪个盒被锁了；
+        /// 在标题最左侧再放一个，视线不用找就知道状态。
+        /// </summary>
+        private void DrawLockBadge(Graphics g, Rectangle titleRect)
+        {
+            int size = 8;
+            int x = titleRect.X + 6;
+            int y = titleRect.Y + (titleRect.Height - size) / 2;
+
+            using (var pen = new Pen(Color.FromArgb(0xD8, _theme.Accent), 1.3f))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+
+                g.DrawArc(pen, x + 1, y, size - 2, size - 3, 180, 180);
+                g.DrawRectangle(pen, x, y + 3, size, size - 4);
+            }
+        }
+
+        /// <summary>
+        /// 拖拽排序时画在标签行上的反馈：被拖的标签提亮，落点画一条插入竖线。
+        ///
+        /// 没有这个反馈的话，拖动过程中完全看不出会插到哪里，
+        /// 松手才知道结果 —— 跟「没反应」没区别。
+        /// </summary>
+        /// <param name="dragIndex">正被拖动的标签下标，-1 表示无。</param>
+        /// <param name="dropIndex">插入槽位（0..count），-1 表示不显示。</param>
+        public void DrawTabReorderMark(Graphics g, Rectangle[] tabRects,
+                                       int dragIndex, int dropIndex)
+        {
+            if (_disposed || g == null) return;
+            if (tabRects == null || tabRects.Length == 0) return;
+
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            int top = tabRects[0].Top + 1;
+            int bottom = tabRects[0].Bottom - 2;
+
+            // 被拖的那个：压一层淡底 + 主色框，表示「它正被拿起来」
+            if (dragIndex >= 0 && dragIndex < tabRects.Length)
+            {
+                Rectangle d = tabRects[dragIndex];
+                using (var brush = new SolidBrush(Color.FromArgb(0x33, _theme.Accent)))
+                {
+                    FillRoundedRect(g, brush, d, 3);
+                }
+                using (var pen = new Pen(_theme.Accent, 1.4f))
+                {
+                    g.DrawRectangle(pen, d.X + 1, d.Y + 1, d.Width - 2, d.Height - 3);
+                }
+            }
+
+            if (dropIndex < 0) return;
+
+            // 插入位置：画在两个标签之间（末位则画在最后一个标签右侧）
+            int x;
+            if (dropIndex < tabRects.Length) x = tabRects[dropIndex].Left + 1;
+            else x = tabRects[tabRects.Length - 1].Right - 2;
+
+            // 原位（拖到自己左边或右边一格）不画 —— 画了等于骗人说会动
+            if (dragIndex >= 0 && (dropIndex == dragIndex || dropIndex == dragIndex + 1)) return;
+
+            using (var pen = new Pen(_theme.Accent, 2.5f))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                g.DrawLine(pen, x, top, x, bottom);
+            }
+
+            using (var brush = new SolidBrush(_theme.Accent))
+            {
+                g.FillRectangle(brush, x - 2, top, 4, 3);
+                g.FillRectangle(brush, x - 2, bottom - 3, 4, 3);
+            }
+        }
+
+        /// <summary>
+        /// 自绘提示气泡（悬停在标题栏按钮上时出现）。
+        ///
+        /// 用自绘而不是系统 ToolTip：分层窗口没有子控件可以挂 ToolTip，
+        /// 而且气泡要跟着锁定状态实时改文字（点了立刻变），自绘最好控。
+        /// </summary>
+        public void DrawTip(Graphics g, string text, Rectangle anchor, Rectangle view)
+        {
+            if (_disposed || g == null) return;
+            if (string.IsNullOrEmpty(text)) return;
+            if (anchor.IsEmpty) return;
+
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.AntiAlias;
+
+            SizeF sz = MeasureCached(g, text);
+            float w = sz.Width + 14f;
+            float h = sz.Height + 8f;
+
+            float x = anchor.Left + anchor.Width / 2f - w / 2f;
+            float y = anchor.Bottom + 4f;
+
+            // 越界就翻到上方 / 拉回视口内 —— 屏幕边缘的面板同样看得到
+            if (y + h > view.Bottom - 2f) y = anchor.Top - h - 4f;
+            if (y < view.Top + 2f) y = view.Top + 2f;
+            if (x < view.Left + 2f) x = view.Left + 2f;
+            if (x + w > view.Right - 2f) x = view.Right - w - 2f;
+
+            var rect = new RectangleF(x, y, w, h);
+
+            using (var brush = new SolidBrush(Color.FromArgb(0xF2, 0x1F, 0x24, 0x2A)))
+            {
+                FillRoundedRect(g, brush, Rectangle.Round(rect), 4);
+            }
+            using (var pen = new Pen(Color.FromArgb(0x59, 0xFF, 0xFF, 0xFF), 1f))
+            {
+                g.DrawRectangle(pen, Rectangle.Round(rect));
+            }
+            using (var brush = new SolidBrush(Color.FromArgb(0xFF, 0xFF, 0xFF, 0xFF)))
+            {
+                g.DrawString(text, _badgeFont, brush, rect, _centerFormat);
             }
         }
 
