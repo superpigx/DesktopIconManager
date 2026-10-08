@@ -45,6 +45,10 @@
 - 单实例 Mutex 改为 `using` 显式释放
 - 构建脚本加 `/unsafe`，新增 8 个源文件
 
+### 修复
+- **设置窗口浅色分支配色漏写**（`InitUiColors` 的 else 分支六个字段自赋值，编译告警 CS1717）：
+  浅色主题下设置窗口此前用未初始化的 `Color.Empty`（透明/黑），现补上正常浅色配色
+
 ### 回退开关（settings.txt）
 ```
 perfDirtyRect=1     # 0 = 一律整屏重绘

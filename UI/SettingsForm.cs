@@ -70,12 +70,12 @@ namespace DesktopIconManager.UI
             }
             else
             {
-                _cBg     = _cBg;
-                _cPage   = _cPage;
-                _cField  = _cField;
-                _cFg     = _cFg;
-                _cFgSub  = _cFgSub;
-                _cFgHint = _cFgHint;
+                _cBg     = Color.FromArgb(0xF4, 0xF6, 0xF8);
+                _cPage   = Color.FromArgb(0xFF, 0xFF, 0xFF);
+                _cField  = Color.FromArgb(0xFF, 0xFF, 0xFF);
+                _cFg     = Color.FromArgb(0x20, 0x24, 0x28);
+                _cFgSub  = Color.FromArgb(0x55, 0x5C, 0x63);
+                _cFgHint = Color.FromArgb(0x88, 0x8F, 0x96);
             }
         }
 
