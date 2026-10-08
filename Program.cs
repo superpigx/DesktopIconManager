@@ -79,6 +79,7 @@ namespace DesktopIconManager
                 case "shell":     return RunShell(args);
                 case "settings":  return RunSettings();
                 case "show-icons": return RunShowIcons();
+                case "stats":     return RunStats();
                 default:
                     PrintUsage();
                     return 1;
@@ -598,10 +599,13 @@ namespace DesktopIconManager
         {
             // ---- 单实例保护 ----
             // 两个覆盖层同时接管桌面图层会互相覆盖图标位置，必须拦住。
-            // 命名用 "Local\" 前缀 = 会话级；进程退出时系统自动释放，无需显式 Release
+            // 命名用 "Local\" 前缀 = 会话级。
+            // 这里用 using 显式释放：以前依赖终结器，语义上没错但不够明确，
+            // 而且句柄要等到 GC 才归还。
             bool createdNew;
-            var single = new System.Threading.Mutex(
-                true, @"Local\DesktopIconManager.Shell", out createdNew);
+            using (var single = new System.Threading.Mutex(
+                true, @"Local\DesktopIconManager.Shell", out createdNew))
+            {
             if (!createdNew)
             {
                 MessageBox.Show(
@@ -610,6 +614,24 @@ namespace DesktopIconManager
                     "桌面图标管理器", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return 1;
             }
+
+            // ---- 退出残留自检（P0-6）----
+            // 上次如果是被强杀 / 断电结束的，ProcessExit 钩子根本不会执行，
+            // 系统桌面图标就会一直处于隐藏状态。这里把它恢复回来 ——
+            // 最坏情况从「用户手动跑 --show-icons」变成「自愈」。
+            bool crashedLastTime = RunningMarker.Take();
+            if (crashedLastTime)
+            {
+                AppLog.Warn("检测到上次运行未正常退出，已自动恢复系统桌面图标");
+                try { DesktopToggler.ShowIcons(); }
+                catch { }
+
+                Console.WriteLine("  [自检] 上次运行没有正常退出，已自动恢复系统桌面图标。");
+                Console.WriteLine();
+            }
+
+            // ---- 全程正常退出时删除运行标记 ----
+            AppDomain.CurrentDomain.ProcessExit += delegate { RunningMarker.Release(); };
 
             // 默认跟随设置里的主题；命令行给一个非选项参数可临时覆盖
             string themeName = AppSettings.Current.Theme;
@@ -624,9 +646,16 @@ namespace DesktopIconManager
             ThemePalette theme = ThemeBinder.Build(cfg);
 
             Header("桌面覆盖层 · " + themeName + " 主题");
+            Console.WriteLine("  版本: " + AppVersion.Number);
+            Console.WriteLine("  数据目录: " + AppPaths.DataDirectory);
+            Console.WriteLine("  日志: " + AppPaths.LogPath);
+            Console.WriteLine();
+            AppLog.Info("启动覆盖层 · 主题 " + themeName);
 
+            PerfStats.BeginPhase("冲突检测");
             // 冲突检测
             var conflicts = DesktopLayer.DetectConflicts();
+            PerfStats.EndPhase();
             if (conflicts.Count > 0)
             {
                 Console.WriteLine("  [警告] 检测到其他桌面管理程序正在运行：");
@@ -642,13 +671,23 @@ namespace DesktopIconManager
             }
 
             // 载入或初始化布局
+            PerfStats.BeginPhase("载入布局");
             string layoutPath = GroupLayout.DefaultPath();
             GroupLayout layout;
             if (GroupLayout.IsLayoutFile(layoutPath))
             {
                 layout = GroupLayout.Load(layoutPath);
+                PerfStats.EndPhase();
                 Console.WriteLine("  已载入布局: " + layoutPath);
                 Console.WriteLine(DescribeLayout(layout));
+
+                if (GroupLayout.LastLoadSkipped > 0)
+                {
+                    AppLog.Warn("载入布局时丢弃了 " + GroupLayout.LastLoadSkipped
+                                + " 个路径不合法的条目");
+                    Console.WriteLine("  [注意] 有 " + GroupLayout.LastLoadSkipped
+                                      + " 个条目因路径不合法被忽略（详见日志）。");
+                }
 
                 // 修正历史数据里可能残留的面板重叠
                 // （旧版存在尺寸口径不一致的缺陷，会把重叠坐标写进存档）
@@ -663,6 +702,7 @@ namespace DesktopIconManager
             else
             {
                 layout = GroupLayout.BuildDefault();
+                PerfStats.EndPhase();
                 Console.WriteLine("  首次运行，已按文件类型自动分组。");
                 Console.WriteLine(DescribeLayout(layout));
                 try { layout.Save(layoutPath); }
@@ -706,7 +746,9 @@ namespace DesktopIconManager
                         // 兜底：把「在桌面上但不在任何收纳盒里」的图标收进「未收纳」盒。
                         // 接管桌面后系统图标是隐藏的，漏掉的图标会变得既看不到也点不到。
                         // 注意：此处控制台可能已被 FreeConsole 分离，改用气泡提示。
+                        PerfStats.BeginPhase("收纳未归类图标");
                         int adopted = form.AdoptOrphanIcons();
+                        PerfStats.EndPhase();
                         if (adopted > 0)
                         {
                             tray.Notify("已收纳未归类图标",
@@ -770,13 +812,16 @@ namespace DesktopIconManager
                 Console.WriteLine("  [异常] " + ex.GetType().Name + ": " + ex.Message);
                 if (ex.InnerException != null)
                     Console.WriteLine("  [内层] " + ex.InnerException.Message);
-                Console.WriteLine("  完整堆栈已记录到: bin\\last-error.log");
+                Console.WriteLine("  完整堆栈已记录到: " + AppPaths.LogPath);
                 Console.WriteLine("  若桌面图标未恢复，请运行 --show-icons");
             }
             finally
             {
                 restore(null, null);
+                RunningMarker.Release();
             }
+
+            }   // using (Mutex) —— 单实例保护的作用域到此结束
 
             Footer("覆盖层已关闭 · 系统桌面图标已恢复");
             return 0;
@@ -820,7 +865,7 @@ namespace DesktopIconManager
                     try
                     {
                         MessageBox.Show(
-                            "发生了一个错误，已记录到 bin\\last-error.log。\n\n" +
+                            "发生了一个错误，已记录到：\n" + AppPaths.LogPath + "\n\n" +
                             ea.Exception.Message,
                             "桌面图标管理器",
                             MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -834,21 +879,11 @@ namespace DesktopIconManager
             }
         }
 
-        /// <summary>把异常写到 exe 同目录，避免无控制台时无从排查。</summary>
+        /// <summary>记录异常（统一走 AppLog：单一文件 + 轮转 + 环境头）。</summary>
         private static void WriteCrashLog(Exception ex)
         {
-            try
-            {
-                string path = Path.Combine(
-                    AppDomain.CurrentDomain.BaseDirectory,
-                    "last-error.log");
-
-                File.AppendAllText(path,
-                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " +
-                    ex.ToString() + Environment.NewLine + new string('-', 60) + Environment.NewLine,
-                    Encoding.UTF8);
-            }
-            catch { }
+            if (ex == null) return;
+            AppLog.Fatal("未捕获异常", ex);
         }
 
         /// <summary>
@@ -875,6 +910,98 @@ namespace DesktopIconManager
 
             Footer(ok ? "桌面图标已恢复" : "恢复失败");
             return ok ? 0 : 1;
+        }
+
+        // ============================================================
+        //  运行指标（--stats）
+        // ============================================================
+
+        /// <summary>
+        /// 输出运行指标与环境信息。
+        ///
+        /// 这是复盘里「可观测性优先于进一步优化」的落点 ——
+        /// 在没有渲染耗时 / 帧数 / 内存 / 句柄之前就动渲染链路，最容易引入回归。
+        ///
+        /// 注意：单独运行 --stats 拿到的是**这个命令行进程**的指标
+        /// （没有覆盖层，帧数为 0）。要看真实渲染数据，请用
+        /// `--shell --console` 跑一段时间后退出，或看数据目录下的日志。
+        /// </summary>
+        private static int RunStats()
+        {
+            Header("运行指标 · " + AppVersion.Display);
+
+            AppSettings s = AppSettings.Current;
+
+            Console.WriteLine("  【环境】");
+            Console.WriteLine("  程序目录: " + AppPaths.BaseDirectory);
+            Console.WriteLine("  数据目录: " + AppPaths.DataDirectory);
+            Console.WriteLine("  日志文件: " + AppPaths.LogPath);
+            Console.WriteLine("  进程: " + (Environment.Is64BitProcess ? "64 位" : "32 位")
+                              + "   CLR " + Environment.Version);
+            Console.WriteLine("  系统: " + Environment.OSVersion);
+            Console.WriteLine("  显示器: " + Screen.AllScreens.Length + " 台   虚拟屏幕: "
+                              + SystemInformation.VirtualScreen.Width + "×"
+                              + SystemInformation.VirtualScreen.Height);
+
+            try
+            {
+                IntPtr dv = DesktopToggler.FindDefView();
+                Console.WriteLine("  桌面图层: " + (dv == IntPtr.Zero ? "未找到" : "0x" + dv.ToInt64().ToString("X8")));
+                Console.WriteLine("  系统桌面图标: " + (DesktopToggler.AreIconsVisible() ? "显示" : "隐藏"));
+            }
+            catch { }
+            Console.WriteLine();
+
+            Console.WriteLine("  【布局】");
+            string layoutPath = GroupLayout.DefaultPath();
+            Console.WriteLine("  布局文件: " + layoutPath);
+            try
+            {
+                var info = new FileInfo(layoutPath);
+                Console.WriteLine("  文件大小: " + info.Length + " 字节   修改时间: " + info.LastWriteTime);
+            }
+            catch { }
+
+            try
+            {
+                if (GroupLayout.IsLayoutFile(layoutPath))
+                {
+                    GroupLayout layout = GroupLayout.Load(layoutPath);
+                    Console.WriteLine(DescribeLayout(layout));
+                    if (GroupLayout.LastLoadSkipped > 0)
+                        Console.WriteLine("  路径不合法被忽略: " + GroupLayout.LastLoadSkipped + " 条");
+                }
+                else
+                {
+                    Console.WriteLine("  （尚无布局文件）");
+                }
+            }
+            catch { }
+            Console.WriteLine();
+
+            Console.WriteLine("  【性能开关】");
+            Console.WriteLine("    脏矩形 perfDirtyRect      = " + (s.PerfDirtyRect ? "开" : "关"));
+            Console.WriteLine("    强制整屏 perfFullRedraw   = " + (s.PerfFullRedraw ? "开（回退模式）" : "关"));
+            Console.WriteLine("    指针预乘 perfFastBlit     = " + (s.PerfFastBlit ? "开" : "关"));
+            Console.WriteLine("    投影缓存 perfCacheShadow  = " + (s.PerfCacheShadow ? "开" : "关"));
+            Console.WriteLine("    光晕缓存 perfCacheLabelHalo = " + (s.PerfCacheLabelHalo ? "开" : "关"));
+            Console.WriteLine("    COM 通道 useFolderView    = " + (s.UseFolderView ? "开" : "关（默认，LVM 回退）"));
+            Console.WriteLine("    图标缓存上限              = " + s.IconCacheLimit);
+            Console.WriteLine("    悬停节流                  = " + s.HoverThrottleMs + " ms");
+            Console.WriteLine("    落盘去抖                  = " + s.SaveDebounceMs + " ms");
+            Console.WriteLine();
+
+            if (PerfStats.PhaseReport.Length > 0)
+            {
+                Console.WriteLine("  【启动阶段耗时】");
+                Console.WriteLine(PerfStats.PhaseReport);
+            }
+
+            Console.WriteLine("  【本次进程指标】");
+            Console.WriteLine(PerfStats.Report());
+
+            Footer("指标输出完毕");
+            return 0;
         }
 
         // ============================================================
@@ -1043,6 +1170,7 @@ namespace DesktopIconManager
             Console.WriteLine("  --settings   打开设置窗口（不接管桌面，可随时运行）");
             Console.WriteLine("               主题 / 尺寸 / 吸附 / 分类规则都在这里改");
             Console.WriteLine("  --show-icons 应急：恢复系统桌面图标");
+            Console.WriteLine("  --stats      输出版本 / 数据目录 / 布局 / 性能开关 / 运行指标");
             Console.WriteLine();
             Console.WriteLine("  --utf8       强制控制台 UTF-8 输出（仅 UTF-8 终端需要）");
             Console.WriteLine();

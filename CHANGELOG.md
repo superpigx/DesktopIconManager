@@ -2,6 +2,62 @@
 
 所有对外可见的变更记录于此。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.9.2] - 2026-10-08
+
+本轮为「启动快 / 占用小 / 安全智能 / 不拖累系统」整体复盘的落地（详见 `性能与架构复盘-0.9.1.md`）。
+功能与交互全部保持不变，只动性能、安全与可观测性。
+
+### 性能
+- **渲染链路不再每帧分配**：临时 `byte[]` 与 GDI 内存 DC / DIBSection 全部复用（尺寸不变不重建），
+  1080p 下消除每帧 8.3MB 的 LOH 分配与 DIBSection 建销（4K 为 33MB）
+- **GDI 资源按整屏一次性分配**，脏矩形只填充并提交子区域 —— 避免"按脏区尺寸分配"导致的反复重建
+- **预乘 alpha 指针版**（`perfFastBlit`，需 `/unsafe`）；关闭则用托管版，两者逻辑一致可对照
+- **脏矩形局部重绘**（`perfDirtyRect`）：拖动 / 悬停只重画变化区域，脏区取「变化前 ∪ 变化后 ∪ 参考线 ∪ 组合高亮」并外扩投影边距
+- **悬停重绘节流**（`hoverThrottleMs`，默认 16ms），密集移动时合并为一次重绘
+- **投影位图缓存**（`perfCacheShadow`）：每盒每帧 8 层圆角描边 → 一次 1:1 贴图
+- **标签光晕位图缓存**（`perfCacheLabelHalo`）：每标签每帧 8 次 DrawString → 一次贴图
+- **图标缓存 LRU 封顶**（`iconCacheLimit`，默认 200）：此前只增不减，几百个快捷方式就是数 MB
+- **冷启动**：冲突检测由 8 次全进程枚举改为 1 次进程快照
+- **首帧不再画两遍**：合并 `OnHandleCreated` 与 `OnShown` 的重复全屏渲染（保留"首帧未成功则补画"兜底）
+
+### 安全
+- **修两处输入校验硬伤**：
+  1. `ShellLauncher.OpenContainingFolder` 不再把路径拼进 `explorer.exe "/select,..."` 命令行
+     （文件名含双引号会破坏参数结构 = 引号注入），改走 `SHOpenFolderAndSelectItems`（传 PIDL，无拼接）
+  2. `groups.txt` 里的 `FullPath` 载入时校验、打开前二次校验 —— 挡住"存档投毒"面
+- **数据文件读取加上限**（8MB / 20 万行），损坏或恶意大文件不再被全量读进内存
+- **权限最小化**：新增 Shell 官方 COM 通道（IFolderView2 → IFolderView/IShellItemArray）读桌面图标文本，
+  从而不再为"读"而申请 `PROCESS_VM_WRITE`；LVM 通道保留为回退。
+  **默认关闭**（`useFolderView=0`）—— COM vtable 调用需真机验证，失败时自动回退并记日志
+
+### 可靠性
+- **原子写 + `.bak`**：布局 / 设置 / 快照全部改为「写 .tmp → 原子替换 → 保留上一版」，断电或写一半不再损坏
+- **退出残留自检**：新增运行标记，上次被强杀 / 断电时下次启动自动恢复系统桌面图标（原来只能手动 `--show-icons`）
+- **布局落盘去抖**（`saveDebounceMs`，默认 3s），崩溃最多丢 3 秒改动，且退出时强制落盘
+
+### 可观测性
+- **日志统一入口**：`AppLog`（级别 + 环境头 + 512KB 轮转 2 份），取代原先两处各自追加的 `last-error.log`
+- **新增 `--stats`**：版本 / 数据目录 / 布局规模 / 性能开关 / 启动阶段耗时 / 渲染帧数与耗时 / 内存 · 句柄 · GDI 对象
+
+### 变更
+- **数据目录迁到 `%LOCALAPPDATA%\DesktopIconManager`**（旧位置文件首次运行时自动迁移，复制而非移动）。
+  程序放进 Program Files 时不再出现写入失败或 UAC 提示
+- 单实例 Mutex 改为 `using` 显式释放
+- 构建脚本加 `/unsafe`，新增 8 个源文件
+
+### 回退开关（settings.txt）
+```
+perfDirtyRect=1     # 0 = 一律整屏重绘
+perfFullRedraw=0    # 1 = 强制整屏重绘（脏矩形回退）
+perfFastBlit=1      # 0 = 预乘用托管版
+perfCacheShadow=1   # 0 = 投影每次直接画
+perfCacheLabelHalo=1
+iconCacheLimit=200
+hoverThrottleMs=16
+saveDebounceMs=3000
+useFolderView=0
+```
+
 ## [0.9.1] - 2026-10-08
 
 ### 修复

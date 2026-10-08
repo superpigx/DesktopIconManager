@@ -58,7 +58,7 @@ echo.
 
 rem console 子系统：GUI 可正常开窗，命令行模式也能看到输出
 
-"%CSC%" /nologo /target:exe /platform:anycpu /codepage:65001 /optimize+ /win32icon:app.ico ^
+"%CSC%" /nologo /target:exe /platform:anycpu /codepage:65001 /unsafe /optimize+ /win32icon:app.ico ^
 
     /out:bin\DesktopIconManager.exe ^
 
@@ -97,6 +97,22 @@ rem console 子系统：GUI 可正常开窗，命令行模式也能看到输出
     Core\ShellContextMenu.cs ^
 
     Core\AutoStartManager.cs ^
+
+    Core\AppPaths.cs ^
+
+    Core\AppLog.cs ^
+
+    Core\AppVersion.cs ^
+
+    Core\AtomicFile.cs ^
+
+    Core\PathSafety.cs ^
+
+    Core\RunningMarker.cs ^
+
+    Core\PerfStats.cs ^
+
+    Core\DesktopFolderView.cs ^
 
     UI\ThemePalette.cs ^
 
@@ -182,6 +198,8 @@ echo.
 
 echo   【应急】
 
+echo     [I] 运行指标      - 版本 / 数据目录 / 性能开关 / 进程指标
+
 echo     [R] 恢复系统桌面图标（万一图标不见了就用这个）
 
 echo     [T] 设置          - 主题 / 尺寸 / 吸附 / 分类规则
@@ -219,6 +237,7 @@ if "%choice%"=="8" bin\DesktopIconManager.exe --ui dark
 if "%choice%"=="9" bin\DesktopIconManager.exe --ui glass
 
 if /i "%choice%"=="R" bin\DesktopIconManager.exe --show-icons
+if /i "%choice%"=="I" bin\DesktopIconManager.exe --stats
 
 if /i "%choice%"=="T" bin\DesktopIconManager.exe --settings
 

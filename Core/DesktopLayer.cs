@@ -36,16 +36,32 @@ namespace DesktopIconManager.Core
         private IntPtr _remotePoint = IntPtr.Zero;
         private bool _disposed;
 
+        /// <summary>已申请的进程访问权限（按需补 VM_WRITE）。</summary>
+        private uint _access;
+
+        /// <summary>COM 通道（Shell 官方接口，无需写 explorer 内存）。null = 不可用。</summary>
+        private DesktopFolderView _folderView;
+
+        /// <summary>COM 通道一次性取回的条目名缓存。</summary>
+        private List<string> _comNames;
+
         public IntPtr ListViewHandle { get { return _hwndListView; } }
         public IntPtr DefViewHandle { get; private set; }
         public IntPtr OwnerHandle { get; private set; }
         public uint ExplorerPid { get; private set; }
+
+        /// <summary>当前是否走 Shell COM 通道读文本（不写 explorer 内存）。</summary>
+        public bool UsingFolderView { get { return _folderView != null; } }
 
         private DesktopLayer() { }
 
         /// <summary>
         /// 定位桌面 ListView 并打开跨进程访问句柄。
         /// 返回 null 表示当前桌面并非标准结构（例如被第三方桌面工具接管）。
+        ///
+        /// 权限最小化：默认只要 VM_OPERATION / VM_READ / QUERY_INFORMATION。
+        /// 只有当 COM 通道不可用、必须靠 LVM_GETITEMTEXTW 读文本时，
+        /// 才补申请 VM_WRITE（写 LVITEM 结构用）。
         /// </summary>
         public static DesktopLayer Attach()
         {
@@ -64,22 +80,86 @@ namespace DesktopIconManager.Core
             NativeMethods.GetWindowThreadProcessId(lv, out pid);
             layer.ExplorerPid = pid;
 
-            const uint access = NativeMethods.PROCESS_VM_OPERATION
-                              | NativeMethods.PROCESS_VM_READ
-                              | NativeMethods.PROCESS_VM_WRITE
-                              | NativeMethods.PROCESS_QUERY_INFORMATION;
+            // ---- 先尝试 COM 通道（需设置里显式开启，默认关闭）----
+            bool useCom = false;
+            try { useCom = AppSettings.Current.UseFolderView; }
+            catch { useCom = false; }
 
+            DesktopFolderView fv = null;
+            if (useCom)
+            {
+                try { fv = DesktopFolderView.TryAttach(defView); }
+                catch { fv = null; }
+            }
+
+            uint access = NativeMethods.PROCESS_VM_OPERATION
+                        | NativeMethods.PROCESS_VM_READ
+                        | NativeMethods.PROCESS_QUERY_INFORMATION;
+
+            if (fv == null) access |= NativeMethods.PROCESS_VM_WRITE;
+
+            layer._access = access;
             layer._hProcess = NativeMethods.OpenProcess(access, false, pid);
             if (layer._hProcess == IntPtr.Zero)
+            {
+                if (fv != null) fv.Dispose();
                 return null;
+            }
 
             if (!layer.AllocateRemoteBuffers())
             {
+                if (fv != null) fv.Dispose();
                 layer.Dispose();
                 return null;
             }
 
+            // ---- COM 通道自检：条目数必须与 ListView 一致才敢用 ----
+            if (fv != null)
+            {
+                bool ok = false;
+                try
+                {
+                    int lvCount = layer.Count;
+                    int fvCount;
+                    if (fv.TryGetItemCount(out fvCount) && fvCount == lvCount && lvCount > 0)
+                        ok = true;
+                }
+                catch { ok = false; }
+
+                if (ok)
+                {
+                    layer._folderView = fv;
+                }
+                else
+                {
+                    fv.Dispose();
+                    // 回退到 LVM 读文本 → 必须补写权限
+                    if (!layer.EnsureWriteAccess())
+                    {
+                        layer.Dispose();
+                        return null;
+                    }
+                }
+            }
+
             return layer;
+        }
+
+        /// <summary>补申请 PROCESS_VM_WRITE（LVM 读文本的回退路径需要它）。</summary>
+        private bool EnsureWriteAccess()
+        {
+            if ((_access & NativeMethods.PROCESS_VM_WRITE) != 0)
+                return _hProcess != IntPtr.Zero;
+
+            uint want = _access | NativeMethods.PROCESS_VM_WRITE;
+            IntPtr h = NativeMethods.OpenProcess(want, false, ExplorerPid);
+            if (h == IntPtr.Zero) return false;
+
+            if (_hProcess != IntPtr.Zero) NativeMethods.CloseHandle(_hProcess);
+
+            _hProcess = h;
+            _access = want;
+            return true;
         }
 
         /// <summary>查找桌面 ListView 句柄。</summary>
@@ -169,11 +249,33 @@ namespace DesktopIconManager.Core
             }
         }
 
-        /// <summary>读取指定序号的图标标题。</summary>
+        /// <summary>
+        /// 读取指定序号的图标标题。
+        ///
+        /// 优先走 COM 通道（不写 explorer 内存）；
+        /// 不可用时回退到 LVM_GETITEMTEXTW（需要 VM_WRITE）。
+        /// </summary>
         public string GetItemText(int index)
         {
             EnsureAlive();
 
+            if (_folderView != null)
+            {
+                if (_comNames == null)
+                {
+                    List<string> names;
+                    if (_folderView.TryGetItemTexts(out names)) _comNames = names;
+                }
+
+                if (_comNames != null && index >= 0 && index < _comNames.Count)
+                    return _comNames[index];
+            }
+
+            return GetItemTextViaLvm(index);
+        }
+
+        private string GetItemTextViaLvm(int index)
+        {
             var item = new NativeMethods.LVITEM();
             item.mask = NativeMethods.LVIF_TEXT;
             item.iItem = index;
@@ -283,6 +385,9 @@ namespace DesktopIconManager.Core
             sb.AppendFormat("  宿主窗口类名: {0}\r\n", string.IsNullOrEmpty(ownerClass) ? "?" : ownerClass);
             sb.AppendFormat("  explorer PID: {0}\r\n", ExplorerPid);
             sb.AppendFormat("  进程位数匹配: {0}\r\n", Environment.Is64BitProcess ? "64 位" : "32 位");
+            sb.AppendFormat("  文本读取通道: {0}\r\n",
+                _folderView != null ? "Shell COM (IFolderView，不写 explorer 内存)"
+                                    : "LVM_GETITEMTEXTW (需 PROCESS_VM_WRITE)");
             return sb.ToString();
         }
 
@@ -297,10 +402,15 @@ namespace DesktopIconManager.Core
         /// <summary>
         /// 检测是否存在冲突的第三方桌面管理程序。
         /// 两个程序同时接管桌面图层会导致图标行为异常。
+        ///
+        /// 性能：原先对 8 个进程名各调一次 Process.GetProcessesByName，
+        /// 而它内部每次都要做一次完整的进程快照 —— 冷启动白白花掉十几到几十毫秒。
+        /// 现在只取**一次**快照后按名匹配。
         /// </summary>
         public static IList<string> DetectConflicts()
         {
             var conflicts = new List<string>();
+
             string[] known =
             {
                 "360DesktopLite64", "360DesktopLite", "360DesktopService64",
@@ -308,18 +418,29 @@ namespace DesktopIconManager.Core
                 "DeskBox", "CloudDriveDesktopWidgetIndependent"
             };
 
-            foreach (string name in known)
+            var wanted = new HashSet<string>(known, StringComparer.OrdinalIgnoreCase);
+
+            Process[] all;
+            try { all = Process.GetProcesses(); }
+            catch { return conflicts; }
+
+            foreach (Process p in all)
             {
-                Process[] procs;
-                try { procs = Process.GetProcessesByName(name); }
-                catch { continue; }
-
-                if (procs.Length > 0)
+                try
                 {
-                    conflicts.Add(string.Format("{0} (PID {1})", name, procs[0].Id));
+                    string name = p.ProcessName;
+                    if (!string.IsNullOrEmpty(name) && wanted.Contains(name))
+                        conflicts.Add(string.Format("{0} (PID {1})", name, p.Id));
                 }
-
-                foreach (var p in procs) { try { p.Dispose(); } catch { } }
+                catch
+                {
+                    // 个别系统进程取不到名字，跳过
+                }
+                finally
+                {
+                    try { p.Dispose(); }
+                    catch { }
+                }
             }
 
             return conflicts;
@@ -372,6 +493,13 @@ namespace DesktopIconManager.Core
         {
             if (_disposed) return;
             _disposed = true;
+
+            if (_folderView != null)
+            {
+                try { _folderView.Dispose(); }
+                catch { }
+                _folderView = null;
+            }
 
             if (_hProcess != IntPtr.Zero)
             {

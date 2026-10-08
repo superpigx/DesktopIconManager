@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Drawing.Text;
 using DesktopIconManager.Core;
 
@@ -49,6 +50,89 @@ namespace DesktopIconManager.UI
         /// </summary>
         private readonly Dictionary<string, SizeF> _measureCache =
             new Dictionary<string, SizeF>(64);
+
+        // ============================================================
+        //  位图缓存（复盘 P1-11）
+        // ============================================================
+
+        /// <summary>
+        /// 投影位图缓存。
+        /// 投影是「8 层递减 alpha 的圆角描边」，每盒每帧 8 次 DrawPath + 抗锯齿；
+        /// 面板在拖动过程中尺寸不变，完全可以预渲染一次后贴图。
+        /// </summary>
+        private readonly Dictionary<string, Bitmap> _shadowCache =
+            new Dictionary<string, Bitmap>(16);
+        private readonly LinkedList<string> _shadowLru = new LinkedList<string>();
+        private const int MaxShadowCache = 12;
+
+        /// <summary>
+        /// 图标标签光晕位图缓存。
+        /// 光晕是「8 个方向各画一遍文字」，每个标签每帧 8 次 DrawString ——
+        /// 光晕只取决于文本与矩形尺寸，同样可以预渲染。
+        /// </summary>
+        private readonly Dictionary<string, Bitmap> _haloCache =
+            new Dictionary<string, Bitmap>(64);
+        private readonly LinkedList<string> _haloLru = new LinkedList<string>();
+        private const int MaxHaloCache = 64;
+
+        private bool _useShadowCache = true;
+        private bool _useHaloCache = true;
+
+        /// <summary>投影位图缓存开关（关闭 = 回到每次直接绘制，观感一致）。</summary>
+        public bool UseShadowCache
+        {
+            get { return _useShadowCache; }
+            set
+            {
+                if (_useShadowCache == value) return;
+                _useShadowCache = value;
+                ClearShadowCache();
+            }
+        }
+
+        /// <summary>光晕位图缓存开关（关闭 = 回到每次直接绘制，观感一致）。</summary>
+        public bool UseHaloCache
+        {
+            get { return _useHaloCache; }
+            set
+            {
+                if (_useHaloCache == value) return;
+                _useHaloCache = value;
+                ClearHaloCache();
+            }
+        }
+
+        private static void TouchLru(LinkedList<string> lru, string key)
+        {
+            LinkedListNode<string> first = lru.First;
+            if (first != null && string.Equals(first.Value, key, StringComparison.Ordinal))
+                return;
+
+            LinkedListNode<string> found = lru.Find(key);
+            if (found != null) lru.Remove(found);
+
+            lru.AddFirst(key);
+        }
+
+        private void ClearShadowCache()
+        {
+            foreach (Bitmap b in _shadowCache.Values)
+            {
+                if (b != null) { try { b.Dispose(); } catch { } }
+            }
+            _shadowCache.Clear();
+            _shadowLru.Clear();
+        }
+
+        private void ClearHaloCache()
+        {
+            foreach (Bitmap b in _haloCache.Values)
+            {
+                if (b != null) { try { b.Dispose(); } catch { } }
+            }
+            _haloCache.Clear();
+            _haloLru.Clear();
+        }
 
         /// <summary>带缓存的文本测量（限定用 _badgeFont 绘制的短串）。</summary>
         private SizeF MeasureCached(Graphics g, string text)
@@ -220,26 +304,24 @@ namespace DesktopIconManager.UI
             // 比原来固定 4 层 alpha=10 的写法柔和得多
             if (_theme.DrawShadow && _theme.ShadowDepth > 0)
             {
-                int depth = _theme.ShadowDepth;
-                int offY = _theme.ShadowOffsetY;
+                int pad = _theme.ShadowDepth + 1;
 
-                for (int i = depth; i >= 1; i--)
+                if (_useShadowCache)
                 {
-                    // 二次衰减：靠内浓、靠外淡
-                    int a = 26 * i * i / (depth * depth);
-                    if (a <= 0) continue;
-                    if (a > 40) a = 40;
-
-                    Rectangle shadow = new Rectangle(
-                        bounds.X - i,
-                        bounds.Y - i + offY,
-                        bounds.Width + i * 2,
-                        bounds.Height + i * 2);
-
-                    using (var pen = new Pen(Color.FromArgb(a, 0, 0, 0), 1f))
+                    Bitmap shadow = GetShadowBitmap(bounds.Width, bounds.Height);
+                    if (shadow != null)
                     {
-                        DrawRoundedRect(g, pen, shadow);
+                        // 1:1 贴图，不缩放 —— 与直接绘制逐像素一致
+                        g.DrawImage(shadow, bounds.X - pad, bounds.Y - pad);
                     }
+                    else
+                    {
+                        DrawShadowInto(g, bounds);
+                    }
+                }
+                else
+                {
+                    DrawShadowInto(g, bounds);
                 }
             }
 
@@ -593,23 +675,45 @@ namespace DesktopIconManager.UI
 
             if (_theme.DrawLabelHalo)
             {
-                using (var halo = new SolidBrush(_theme.LabelHalo))
+                if (_useHaloCache)
                 {
-                    for (int dx = -1; dx <= 1; dx++)
+                    Bitmap halo = GetHaloBitmap(text, rect.Width, rect.Height);
+                    if (halo != null)
                     {
-                        for (int dy = -1; dy <= 1; dy++)
-                        {
-                            if (dx == 0 && dy == 0) continue;
-                            var r = new Rectangle(rect.X + dx, rect.Y + dy, rect.Width, rect.Height);
-                            g.DrawString(text, _labelFont, halo, r, _labelFormat);
-                        }
+                        // 1:1 贴图（位图比矩形外扩 1px，故偏移 -1）
+                        g.DrawImage(halo, rect.X - 1, rect.Y - 1);
                     }
+                    else
+                    {
+                        DrawHaloDirect(g, rect, text);
+                    }
+                }
+                else
+                {
+                    DrawHaloDirect(g, rect, text);
                 }
             }
 
             using (var brush = new SolidBrush(fore))
             {
                 g.DrawString(text, _labelFont, brush, rect, _labelFormat);
+            }
+        }
+
+        /// <summary>直接画光晕（缓存关闭或缓存生成失败时的路径）。</summary>
+        private void DrawHaloDirect(Graphics g, Rectangle rect, string text)
+        {
+            using (var halo = new SolidBrush(_theme.LabelHalo))
+            {
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    for (int dy = -1; dy <= 1; dy++)
+                    {
+                        if (dx == 0 && dy == 0) continue;
+                        var r = new Rectangle(rect.X + dx, rect.Y + dy, rect.Width, rect.Height);
+                        g.DrawString(text, _labelFont, halo, r, _labelFormat);
+                    }
+                }
             }
         }
 
@@ -1007,6 +1111,184 @@ namespace DesktopIconManager.UI
             }
         }
 
+        /// <summary>
+        /// 把投影画进 g。bounds 是面板矩形（不是投影外扩后的矩形）。
+        /// 抽出来是为了「直接画」与「预渲染到缓存位图」两条路径共用同一段代码，
+        /// 保证缓存开关切换时观感完全一致。
+        /// </summary>
+        private void DrawShadowInto(Graphics g, Rectangle bounds)
+        {
+            if (_disposed || g == null) return;
+
+            int depth = _theme.ShadowDepth;
+            int offY = _theme.ShadowOffsetY;
+            if (depth <= 0) return;
+
+            SmoothingMode oldSmooth = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            try
+            {
+                for (int i = depth; i >= 1; i--)
+                {
+                    // 二次衰减：靠内浓、靠外淡
+                    int a = 26 * i * i / (depth * depth);
+                    if (a <= 0) continue;
+                    if (a > 40) a = 40;
+
+                    Rectangle shadow = new Rectangle(
+                        bounds.X - i,
+                        bounds.Y - i + offY,
+                        bounds.Width + i * 2,
+                        bounds.Height + i * 2);
+
+                    using (var pen = new Pen(Color.FromArgb(a, 0, 0, 0), 1f))
+                    {
+                        DrawRoundedRect(g, pen, shadow);
+                    }
+                }
+            }
+            finally
+            {
+                g.SmoothingMode = oldSmooth;
+            }
+        }
+
+        /// <summary>
+        /// 取（或生成）某尺寸的投影位图。
+        /// 位图比面板大一圈（pad = depth+1），绘制时左上角对齐 bounds - pad。
+        /// 生成失败返回 null —— 调用方会退回直接绘制，功能不受影响。
+        /// </summary>
+        private Bitmap GetShadowBitmap(int w, int h)
+        {
+            if (_disposed || w <= 0 || h <= 0) return null;
+            if (w > 4000 || h > 4000) return null;      // 异常尺寸不预渲染，避免吃掉大内存
+
+            string key = w + "x" + h;
+
+            Bitmap cached;
+            if (_shadowCache.TryGetValue(key, out cached))
+            {
+                TouchLru(_shadowLru, key);
+                return cached;
+            }
+
+            Bitmap bmp = null;
+            try
+            {
+                int depth = _theme.ShadowDepth;
+                int offY = _theme.ShadowOffsetY;
+                int pad = depth + 1;
+
+                int bw = w + pad * 2;
+                int bh = h + pad * 2 + offY;
+                if (bw <= 0 || bh <= 0) return null;
+
+                bmp = new Bitmap(bw, bh, PixelFormat.Format32bppArgb);
+
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    // 位图默认是全透明，正好当作干净画布
+                    DrawShadowInto(g, new Rectangle(pad, pad, w, h));
+                }
+
+                _shadowCache[key] = bmp;
+                TouchLru(_shadowLru, key);
+
+                while (_shadowCache.Count > MaxShadowCache && _shadowLru.Count > 0)
+                {
+                    LinkedListNode<string> last = _shadowLru.Last;
+                    if (last == null) break;
+
+                    _shadowLru.RemoveLast();
+
+                    Bitmap victim;
+                    if (_shadowCache.TryGetValue(last.Value, out victim))
+                    {
+                        _shadowCache.Remove(last.Value);
+                        if (victim != null) { try { victim.Dispose(); } catch { } }
+                    }
+                }
+
+                return bmp;
+            }
+            catch
+            {
+                if (bmp != null) { try { bmp.Dispose(); } catch { } }
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 取（或生成）标签光晕位图。
+        /// 内容 = 8 个方向各画一遍文字；绘制时按 1:1 贴到标签矩形上。
+        /// </summary>
+        private Bitmap GetHaloBitmap(string text, int w, int h)
+        {
+            if (_disposed || string.IsNullOrEmpty(text)) return null;
+            if (w <= 0 || h <= 0 || w > 1024 || h > 256) return null;
+
+            string key = text + "|" + w + "x" + h;
+
+            Bitmap cached;
+            if (_haloCache.TryGetValue(key, out cached))
+            {
+                TouchLru(_haloLru, key);
+                return cached;
+            }
+
+            Bitmap bmp = null;
+            try
+            {
+                // 上下左右各留 1px：8 向偏移里 +1 那一笔会画到矩形外 1 像素，
+                // 不留边就会被裁掉，和直接绘制差 1px
+                bmp = new Bitmap(w + 2, h + 2, PixelFormat.Format32bppArgb);
+
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.TextRenderingHint = TextRenderingHint.AntiAlias;
+
+                    using (var halo = new SolidBrush(_theme.LabelHalo))
+                    {
+                        for (int dx = -1; dx <= 1; dx++)
+                        {
+                            for (int dy = -1; dy <= 1; dy++)
+                            {
+                                if (dx == 0 && dy == 0) continue;
+                                var r = new Rectangle(1 + dx, 1 + dy, w, h);
+                                g.DrawString(text, _labelFont, halo, r, _labelFormat);
+                            }
+                        }
+                    }
+                }
+
+                _haloCache[key] = bmp;
+                TouchLru(_haloLru, key);
+
+                while (_haloCache.Count > MaxHaloCache && _haloLru.Count > 0)
+                {
+                    LinkedListNode<string> last = _haloLru.Last;
+                    if (last == null) break;
+
+                    _haloLru.RemoveLast();
+
+                    Bitmap victim;
+                    if (_haloCache.TryGetValue(last.Value, out victim))
+                    {
+                        _haloCache.Remove(last.Value);
+                        if (victim != null) { try { victim.Dispose(); } catch { } }
+                    }
+                }
+
+                return bmp;
+            }
+            catch
+            {
+                if (bmp != null) { try { bmp.Dispose(); } catch { } }
+                return null;
+            }
+        }
+
         private static GraphicsPath RoundedPath(Rectangle r, int radius)
         {
             int d = radius * 2;
@@ -1033,6 +1315,9 @@ namespace DesktopIconManager.UI
         {
             if (_disposed) return;
             _disposed = true;
+
+            ClearShadowCache();
+            ClearHaloCache();
 
             _titleFont.Dispose();
             _tabFont.Dispose();

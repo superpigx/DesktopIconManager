@@ -45,7 +45,9 @@ namespace DesktopIconManager.Core
         /// <summary>用系统默认程序打开文件或文件夹。</summary>
         public static bool Open(string path)
         {
-            if (string.IsNullOrEmpty(path)) return false;
+            // 路径可能来自存档文件（外部数据）—— 打开前必须校验，
+            // 否则被篡改的 groups.txt 能诱导打开任意程序（存档投毒）
+            if (!PathSafety.IsOpenable(path)) return false;
 
             var info = new SHELLEXECUTEINFO();
             info.cbSize = Marshal.SizeOf(typeof(SHELLEXECUTEINFO));
@@ -62,7 +64,7 @@ namespace DesktopIconManager.Core
         /// <summary>弹出系统「属性」对话框。</summary>
         public static bool ShowProperties(string path)
         {
-            if (string.IsNullOrEmpty(path)) return false;
+            if (!PathSafety.IsOpenable(path)) return false;
 
             var info = new SHELLEXECUTEINFO();
             info.cbSize = Marshal.SizeOf(typeof(SHELLEXECUTEINFO));
@@ -75,16 +77,94 @@ namespace DesktopIconManager.Core
             catch { return false; }
         }
 
-        /// <summary>在资源管理器中定位并选中该文件。</summary>
+        /// <summary>
+        /// 在资源管理器中定位并选中该文件。
+        ///
+        /// ★ 这里修掉了一处真实的注入面：
+        ///   旧实现把路径直接拼进 `explorer.exe "/select,\"path\""`，
+        ///   文件名里只要带一个双引号，参数结构就被破坏，
+        ///   最坏会定位/打开到意外路径（引号注入）。
+        ///
+        ///   现在改走 SHOpenFolderAndSelectItems —— 传 PIDL 而不是命令行，
+        ///   根本不存在"拼字符串"这件事，也从根上消除了转义问题。
+        ///   该 API 不可用时才回退到旧写法（并且回退分支会先做转义）。
+        /// </summary>
         public static bool OpenContainingFolder(string path)
         {
-            if (string.IsNullOrEmpty(path)) return false;
+            if (!PathSafety.IsPlausible(path)) return false;
 
             try
             {
+                if (!(File.Exists(path) || Directory.Exists(path)))
+                {
+                    string parent = Path.GetDirectoryName(path);
+                    if (string.IsNullOrEmpty(parent)) return false;
+                    if (!PathSafety.IsPlausible(parent)) return false;
+                    if (!Directory.Exists(parent)) return false;
+
+                    path = parent;
+                }
+
+                if (TrySelectViaShell(path)) return true;
+                return TrySelectViaExplorer(path);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+        private static extern void SHParseDisplayName(
+            string pszName, IntPtr pbc, out IntPtr ppidl, uint sfgaoIn, out uint psfgaoOut);
+
+        /// <summary>
+        /// cidl=0 且传入的是目标文件自身的 PIDL 时，
+        /// Shell 会打开其所在文件夹并选中它 —— 正是我们要的"/select"效果。
+        /// </summary>
+        [DllImport("shell32.dll", PreserveSig = true)]
+        private static extern int SHOpenFolderAndSelectItems(
+            IntPtr pidlFolder, uint cidl, IntPtr apidl, uint dwFlags);
+
+        [DllImport("shell32.dll")]
+        private static extern void ILFree(IntPtr pidl);
+
+        private static bool TrySelectViaShell(string path)
+        {
+            IntPtr pidl = IntPtr.Zero;
+
+            try
+            {
+                uint flags;
+                SHParseDisplayName(path, IntPtr.Zero, out pidl, 0, out flags);
+                if (pidl == IntPtr.Zero) return false;
+
+                int hr = SHOpenFolderAndSelectItems(pidl, 0, IntPtr.Zero, 0);
+                return hr >= 0;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                if (pidl != IntPtr.Zero)
+                {
+                    try { ILFree(pidl); }
+                    catch { }
+                }
+            }
+        }
+
+        /// <summary>回退分支：拼命令行，但先把引号转义干净。</summary>
+        private static bool TrySelectViaExplorer(string path)
+        {
+            try
+            {
+                string quoted = PathSafety.QuoteArgument(path);
                 string args = File.Exists(path) || Directory.Exists(path)
-                    ? "/select,\"" + path + "\""
-                    : "\"" + (Path.GetDirectoryName(path) ?? path) + "\"";
+                    ? "/select," + quoted
+                    : quoted;
 
                 var psi = new ProcessStartInfo("explorer.exe", args);
                 psi.UseShellExecute = true;
@@ -111,6 +191,8 @@ namespace DesktopIconManager.Core
         public static bool OpenWithFallback(string path)
         {
             if (Open(path)) return true;
+
+            if (!PathSafety.IsOpenable(path)) return false;
 
             try
             {

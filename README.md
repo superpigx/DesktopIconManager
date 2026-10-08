@@ -56,6 +56,50 @@
 
 ---
 
+## 数据目录
+
+0.9.2 起，布局 / 设置 / 快照 / 日志都放在：
+
+```
+%LOCALAPPDATA%\DesktopIconManager\
+    groups.txt                    布局（用户唯一资产，另有 groups.txt.bak）
+    settings.txt                  设置
+    positions_snapshot.txt        图标位置快照
+    desktop-icon-manager.log      运行日志（512KB 轮转，保留 2 份）
+    running.mark                  运行标记（用于异常退出自检）
+```
+
+`groups.txt` / `settings.txt` 若还留在 exe 同目录，首次运行会**自动复制**过去
+（复制而非移动，老版本 exe 仍可读自己的文件）。
+
+> 迁移的原因：程序被放进 Program Files 时，写自身目录会失败或触发 UAC 提示。
+
+**写入是原子的**：先写 `.tmp` → 原子替换 → 把上一版留成 `.bak`。
+写一半断电 / 崩溃不会损坏布局。
+
+---
+
+## 性能开关（settings.txt 高级项）
+
+这几项都有保守回退路径，出问题把对应开关关掉即可，功能不受影响。
+
+| 键 | 默认 | 作用 | 关掉会怎样 |
+|---|---|---|---|
+| `perfDirtyRect` | 1 | 拖动/悬停只重绘变化区域 | 一律整屏重绘（更慢但最稳） |
+| `perfFullRedraw` | 0 | **强制**整屏重绘 | 0 = 允许走脏矩形 |
+| `perfFastBlit` | 1 | 预乘 alpha 用指针版 | 改用托管版（逻辑一致，稍慢） |
+| `perfCacheShadow` | 1 | 投影预渲染成位图 | 每次直接画（观感一致） |
+| `perfCacheLabelHalo` | 1 | 标签光晕预渲染成位图 | 每次直接画（观感一致） |
+| `iconCacheLimit` | 200 | 图标缓存 LRU 上限 | — |
+| `hoverThrottleMs` | 16 | 悬停重绘节流 | 0 = 不节流 |
+| `saveDebounceMs` | 3000 | 布局落盘去抖 | 0 = 改动即写（旧行为） |
+| `useFolderView` | 0 | 用 Shell COM 接口读桌面图标文本（可去掉 `PROCESS_VM_WRITE`） | 0 = 走 LVM 通道（默认） |
+
+想看实际效果，运行 `--stats`：输出版本、数据目录、布局规模、性能开关、
+启动各阶段耗时、渲染帧数与耗时、内存 / 句柄 / GDI 对象。
+
+---
+
 ## 功能取舍
 
 按「保留主要功能、去掉无用功能」的原则裁剪。
@@ -260,6 +304,10 @@ Shell 扩展菜单是 owner-draw 的，会向宿主窗口发 `WM_DRAWITEM` /
 
 即使程序崩溃，图标也会恢复。万一仍有意外，运行 `--show-icons` 即可。
 
+另外还有一道**退出残留自检**（0.9.2 起）：启动时会写一个运行标记，正常退出时删除。
+若下次启动发现标记还在，说明上次是被强杀 / 断电结束的（上述三条钩子都来不及跑），
+此时会**自动**把系统桌面图标恢复回来 —— 不需要人工介入。
+
 ### 2. 幂等的显示开关
 `HideIcons` / `ShowIcons` 都先探测 `SysListView32` 的可见性再决定是否发送
 切换指令，重复调用不会出错。
@@ -283,12 +331,15 @@ Shell 扩展菜单是 owner-draw 的，会向宿主窗口发 `WM_DRAWITEM` /
 ### 方式三：命令行
 ```bat
 "%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe" ^
-    /nologo /target:exe /platform:anycpu /optimize+ ^
+    /nologo /target:exe /platform:anycpu /unsafe /optimize+ ^
     /out:bin\DesktopIconManager.exe ^
     /reference:System.dll /reference:System.Core.dll ^
     /reference:System.Drawing.dll /reference:System.Windows.Forms.dll ^
     Program.cs Core\*.cs UI\*.cs
 ```
+
+> `/unsafe` 是给预乘 alpha 的指针版用的。去掉它也能编译吗？
+> **不能** —— 改回托管版请保留 `/unsafe`，并在 `settings.txt` 里设 `perfFastBlit=0`。
 
 > 使用 `console` 子系统而非 `winexe`：GUI 能正常开窗，同时命令行模式保留输出。
 

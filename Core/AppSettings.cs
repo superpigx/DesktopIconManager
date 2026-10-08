@@ -106,6 +106,43 @@ namespace DesktopIconManager.Core
         /// <summary>开机自动启动覆盖层（写 HKCU Run，不需要管理员权限）。</summary>
         public bool AutoStart { get; set; }
 
+        // ---- 性能与高级（复盘 v0.9.2 新增）----
+        /// <summary>
+        /// 用 Shell 官方 COM 接口（IFolderView）读桌面图标文本，
+        /// 从而不再对 explorer 申请 PROCESS_VM_WRITE。
+        /// 默认关闭 —— 该路径依赖 COM vtable，需真机验证后才建议开启。
+        /// 关闭时文本读取回退到 LVM_GETITEMTEXTW（需要 VM_WRITE）。
+        /// </summary>
+        public bool UseFolderView { get; set; }
+
+        /// <summary>拖动/悬停只重绘变化区域（脏矩形）。关闭则始终整屏重绘。</summary>
+        public bool PerfDirtyRect { get; set; }
+
+        /// <summary>
+        /// 强制整屏重绘 —— **回退开关**。
+        /// 脏矩形一旦算错就是残影（0.9.0 出过同类事故），
+        /// 这里保留一键回到"安全网"状态的能力。
+        /// </summary>
+        public bool PerfFullRedraw { get; set; }
+
+        /// <summary>预乘 alpha 走指针版（需 /unsafe 编译）；关闭则用托管版。</summary>
+        public bool PerfFastBlit { get; set; }
+
+        /// <summary>缓存面板投影位图（每盒每帧 8 层圆角描边 → 1 次贴图）。</summary>
+        public bool PerfCacheShadow { get; set; }
+
+        /// <summary>缓存图标标签的文字路径（8 次 DrawString 光晕 → 8 次 FillPath）。</summary>
+        public bool PerfCacheLabelHalo { get; set; }
+
+        /// <summary>图标缓存条目上限（LRU 淘汰）。</summary>
+        public int IconCacheLimit { get; set; }
+
+        /// <summary>悬停重绘节流（毫秒）。0 = 不节流。</summary>
+        public int HoverThrottleMs { get; set; }
+
+        /// <summary>布局自动落盘去抖（毫秒）。0 = 改动即写。</summary>
+        public int SaveDebounceMs { get; set; }
+
         public AppSettings()
         {
             ResetToDefaults();
@@ -150,6 +187,17 @@ namespace DesktopIconManager.Core
             ExtraRuleText = string.Empty;
             DisabledCategories = new List<string>();
             AutoStart = false;
+
+            // 性能与高级
+            UseFolderView = false;
+            PerfDirtyRect = true;
+            PerfFullRedraw = false;
+            PerfFastBlit = true;
+            PerfCacheShadow = true;
+            PerfCacheLabelHalo = true;
+            IconCacheLimit = 200;
+            HoverThrottleMs = 16;
+            SaveDebounceMs = 3000;
         }
 
         public AppSettings Clone()
@@ -196,6 +244,16 @@ namespace DesktopIconManager.Core
             DisabledCategories = new List<string>(
                 o.DisabledCategories ?? new List<string>());
             AutoStart = o.AutoStart;
+
+            UseFolderView = o.UseFolderView;
+            PerfDirtyRect = o.PerfDirtyRect;
+            PerfFullRedraw = o.PerfFullRedraw;
+            PerfFastBlit = o.PerfFastBlit;
+            PerfCacheShadow = o.PerfCacheShadow;
+            PerfCacheLabelHalo = o.PerfCacheLabelHalo;
+            IconCacheLimit = o.IconCacheLimit;
+            HoverThrottleMs = o.HoverThrottleMs;
+            SaveDebounceMs = o.SaveDebounceMs;
         }
 
         // ============================================================
@@ -224,9 +282,16 @@ namespace DesktopIconManager.Core
             _current = s;
         }
 
+        /// <summary>
+        /// 设置文件位置。
+        ///
+        /// 已从「exe 同目录」迁到 %LOCALAPPDATA%\DesktopIconManager
+        /// （旧位置的文件会在首次运行时被自动迁移）。
+        /// 原因：程序被放进 Program Files 时，写自身目录会失败或触发 UAC 提示。
+        /// </summary>
         public static string DefaultPath()
         {
-            return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.txt");
+            return AppPaths.ResolveDataFile("settings.txt");
         }
 
         // ============================================================
@@ -238,9 +303,9 @@ namespace DesktopIconManager.Core
             var s = new AppSettings();
             if (string.IsNullOrEmpty(path) || !File.Exists(path)) return s;
 
+            // 安全读：文件过大 / 损坏 → 直接用默认值，绝不把垃圾全读进内存
             string[] lines;
-            try { lines = File.ReadAllLines(path, Encoding.UTF8); }
-            catch { return s; }
+            if (!AtomicFile.TryReadLines(path, out lines) || lines == null) return s;
 
             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
@@ -293,6 +358,16 @@ namespace DesktopIconManager.Core
                 GetStr(map, "disabledCategories", string.Empty));
             s.AutoStart = GetBool(map, "autoStart", s.AutoStart);
 
+            s.UseFolderView = GetBool(map, "useFolderView", s.UseFolderView);
+            s.PerfDirtyRect = GetBool(map, "perfDirtyRect", s.PerfDirtyRect);
+            s.PerfFullRedraw = GetBool(map, "perfFullRedraw", s.PerfFullRedraw);
+            s.PerfFastBlit = GetBool(map, "perfFastBlit", s.PerfFastBlit);
+            s.PerfCacheShadow = GetBool(map, "perfCacheShadow", s.PerfCacheShadow);
+            s.PerfCacheLabelHalo = GetBool(map, "perfCacheLabelHalo", s.PerfCacheLabelHalo);
+            s.IconCacheLimit = Clamp(GetInt(map, "iconCacheLimit", s.IconCacheLimit), 32, 2000);
+            s.HoverThrottleMs = Clamp(GetInt(map, "hoverThrottleMs", s.HoverThrottleMs), 0, 100);
+            s.SaveDebounceMs = Clamp(GetInt(map, "saveDebounceMs", s.SaveDebounceMs), 0, 60000);
+
             return s;
         }
 
@@ -339,11 +414,19 @@ namespace DesktopIconManager.Core
                 sb.AppendLine("disabledCategories=" + string.Join(",", DisabledCategories.ToArray()));
             sb.AppendLine("autoStart=" + (AutoStart ? "1" : "0"));
 
-            string dir = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
+            sb.AppendLine("# ---- 性能与高级（改完重启覆盖层生效）----");
+            sb.AppendLine("useFolderView=" + (UseFolderView ? "1" : "0"));
+            sb.AppendLine("perfDirtyRect=" + (PerfDirtyRect ? "1" : "0"));
+            sb.AppendLine("perfFullRedraw=" + (PerfFullRedraw ? "1" : "0"));
+            sb.AppendLine("perfFastBlit=" + (PerfFastBlit ? "1" : "0"));
+            sb.AppendLine("perfCacheShadow=" + (PerfCacheShadow ? "1" : "0"));
+            sb.AppendLine("perfCacheLabelHalo=" + (PerfCacheLabelHalo ? "1" : "0"));
+            sb.AppendLine("iconCacheLimit=" + IconCacheLimit);
+            sb.AppendLine("hoverThrottleMs=" + HoverThrottleMs);
+            sb.AppendLine("saveDebounceMs=" + SaveDebounceMs);
 
-            File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+            // 原子写 + 保留上一版 .bak：断电/写一半不会损坏设置文件
+            AtomicFile.WriteAllText(path, sb.ToString());
         }
 
         public static bool IsSettingsFile(string path)

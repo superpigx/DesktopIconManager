@@ -30,10 +30,13 @@ namespace DesktopIconManager.Core
     {
         private const string Marker = "# DIM-SNAPSHOT v1";
 
+        /// <summary>
+        /// 快照文件位置（%LOCALAPPDATA%\DesktopIconManager，旧位置自动迁移）。
+        /// 快照是安全网，落盘必须用原子写 —— 写一半损坏就等于安全网失效。
+        /// </summary>
         public static string DefaultPath()
         {
-            string dir = AppDomain.CurrentDomain.BaseDirectory;
-            return Path.Combine(dir, "positions_snapshot.txt");
+            return AppPaths.ResolveDataFile("positions_snapshot.txt");
         }
 
         public static void Save(string path, IList<SnapshotEntry> entries)
@@ -58,21 +61,19 @@ namespace DesktopIconManager.Core
                   .Append("\r\n");
             }
 
-            string dir = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
-
-            File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+            AtomicFile.WriteAllText(path, sb.ToString());
         }
 
         public static IList<SnapshotEntry> Load(string path)
         {
             var list = new List<SnapshotEntry>();
 
-            if (!File.Exists(path))
+            if (string.IsNullOrEmpty(path) || !File.Exists(path))
                 return list;
 
-            string[] lines = File.ReadAllLines(path, Encoding.UTF8);
+            string[] lines;
+            if (!AtomicFile.TryReadLines(path, out lines) || lines == null)
+                return list;
 
             foreach (string raw in lines)
             {

@@ -13,6 +13,9 @@
     <PlatformTarget>AnyCPU</PlatformTarget>
     <Prefer32Bit>false</Prefer32Bit>
     <ApplicationIcon>app.ico</ApplicationIcon>
+    <!-- 预乘 alpha 的指针版（OverlayNative.PremultiplyFast）需要它；
+         关掉后代码会自动走托管版（设置 perfFastBlit=0 也可运行时切换） -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="System" />
@@ -35,6 +38,14 @@
     <Compile Include="Core\ShellLauncher.cs" />
     <Compile Include="Core\ShellContextMenu.cs" />
     <Compile Include="Core\AutoStartManager.cs" />
+    <Compile Include="Core\AppPaths.cs" />
+    <Compile Include="Core\AppLog.cs" />
+    <Compile Include="Core\AppVersion.cs" />
+    <Compile Include="Core\AtomicFile.cs" />
+    <Compile Include="Core\PathSafety.cs" />
+    <Compile Include="Core\RunningMarker.cs" />
+    <Compile Include="Core\PerfStats.cs" />
+    <Compile Include="Core\DesktopFolderView.cs" />
     <Compile Include="UI\ThemePalette.cs" />
     <Compile Include="UI\ThemeBinder.cs" />
     <Compile Include="UI\SettingsForm.cs" />

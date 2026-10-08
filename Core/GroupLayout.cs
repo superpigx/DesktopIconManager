@@ -271,10 +271,19 @@ namespace DesktopIconManager.Core
             Groups = new List<FenceBox>();
         }
 
+        /// <summary>
+        /// 布局文件位置。
+        ///
+        /// 已从「exe 同目录」迁到 %LOCALAPPDATA%\DesktopIconManager
+        /// （旧位置的文件会在首次运行时自动迁移过去）。
+        /// </summary>
         public static string DefaultPath()
         {
-            return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "groups.txt");
+            return AppPaths.ResolveDataFile("groups.txt");
         }
+
+        /// <summary>上次载入时因路径不合法而被丢弃的条目数（0 表示存档干净）。</summary>
+        public static int LastLoadSkipped { get; private set; }
 
         // ============================================================
         //  保存 / 载入
@@ -314,21 +323,23 @@ namespace DesktopIconManager.Core
                 }
             }
 
-            string dir = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
-
-            File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+            // 原子写 + 保留上一版 .bak。
+            // 布局是用户唯一的资产，一次覆盖写写一半就可能把它毁掉。
+            AtomicFile.WriteAllText(path, sb.ToString());
         }
 
         public static GroupLayout Load(string path)
         {
+            LastLoadSkipped = 0;
+
             var layout = new GroupLayout();
             if (!File.Exists(path)) return layout;
 
+            // 安全读：过大 / 读失败 → 返回空布局（由调用方重建），
+            // 绝不把几百 MB 的损坏文件全读进内存
             string[] lines;
-            try { lines = File.ReadAllLines(path, Encoding.UTF8); }
-            catch { return layout; }
+            if (!AtomicFile.TryReadLines(path, out lines) || lines == null)
+                return layout;
 
             // 版本判定：宁可当作 v1 多算一遍，也不能把 v2 当 v1 解析
             bool v2 = false;
@@ -387,8 +398,18 @@ namespace DesktopIconManager.Core
                 }
                 else if (p[0] == "I" && p.Length >= 4 && box != null)
                 {
+                    // 存档里的路径来自外部数据 —— 打开前必须校验。
+                    // 这是复盘点名的「存档投毒」面：groups.txt 被篡改后
+                    // 未校验的 FullPath 会被直接交给 ShellExecute。
+                    string full = Unescape(p[3]);
+                    if (!PathSafety.IsPlausible(full))
+                    {
+                        LastLoadSkipped++;
+                        continue;
+                    }
+
                     FenceTab tab = box.Current;
-                    tab.Items.Add(new GroupItem(Unescape(p[2]), Unescape(p[3]), p[1] == "1"));
+                    tab.Items.Add(new GroupItem(Unescape(p[2]), full, p[1] == "1"));
                 }
             }
 
@@ -436,8 +457,15 @@ namespace DesktopIconManager.Core
                     if (!int.TryParse(p[1], out gi)) continue;
                     if (gi < 0 || gi >= layout.Groups.Count) continue;
 
+                    string full = Unescape(p[4]);
+                    if (!PathSafety.IsPlausible(full))
+                    {
+                        LastLoadSkipped++;
+                        continue;
+                    }
+
                     layout.Groups[gi].Items.Add(new GroupItem(
-                        Unescape(p[3]), Unescape(p[4]), p[2] == "1"));
+                        Unescape(p[3]), full, p[2] == "1"));
                 }
             }
 

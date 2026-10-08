@@ -67,11 +67,70 @@ namespace DesktopIconManager.UI
 
         private IImageList _imageList;
         private bool _imageListTried;
+
+        /// <summary>图标本体。按扩展名或完整路径缓存（见 BuildCacheKey）。</summary>
         private readonly Dictionary<string, Icon> _cache =
             new Dictionary<string, Icon>(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>
+        /// 最近使用顺序（表头 = 最近使用）。
+        /// 缓存此前**没有上限**：.lnk/.exe/.url 等按完整路径各存一份，
+        /// 每个 48×48 图标 10~40KB，几百个快捷方式就是好几 MB，且只增不减。
+        /// 现在按 LRU 封顶。
+        /// </summary>
+        private readonly LinkedList<string> _lru = new LinkedList<string>();
+
+        private int _maxCache = 200;
+
+        /// <summary>缓存条目上限（LRU 淘汰）。最小 16。</summary>
+        public int MaxCache
+        {
+            get { return _maxCache; }
+            set { _maxCache = Math.Max(16, value); TrimCache(); }
+        }
+
+        /// <summary>当前缓存了多少个图标（供 --stats 观察）。</summary>
+        public int CacheCount { get { return _cache.Count; } }
+
         /// <summary>当前是否可用高清图标源。</summary>
         public bool HighQualityAvailable { get { return EnsureImageList() != null; } }
+
+        /// <summary>把某个键标记为最近使用。</summary>
+        private void TouchLru(string key)
+        {
+            if (_lru.Count > 0 && _lru.First != null && _lru.First.Value == key) return;
+
+            // LinkedList.Remove 是 O(n)；缓存上限数百级，且只在 miss/命中时走一次，
+            // 相比之前"只增不减"的内存增长，这点开销完全值得
+            LinkedListNode<string> found = _lru.Find(key);
+            if (found != null) _lru.Remove(found);
+
+            _lru.AddFirst(key);
+        }
+
+        /// <summary>按上限淘汰最久未使用的条目。</summary>
+        private void TrimCache()
+        {
+            while (_cache.Count > _maxCache && _lru.Count > 0)
+            {
+                LinkedListNode<string> last = _lru.Last;
+                if (last == null) break;
+
+                string victim = last.Value;
+                _lru.RemoveLast();
+
+                Icon icon;
+                if (_cache.TryGetValue(victim, out icon))
+                {
+                    _cache.Remove(victim);
+                    if (icon != null)
+                    {
+                        try { icon.Dispose(); }
+                        catch { }
+                    }
+                }
+            }
+        }
 
         private IImageList EnsureImageList()
         {
@@ -108,11 +167,18 @@ namespace DesktopIconManager.UI
 
             Icon cached;
             if (_cache.TryGetValue(key, out cached))
+            {
+                TouchLru(key);
                 return cached;
+            }
 
             Icon icon = LoadIcon(path, isDirectory);
             if (icon != null)
+            {
                 _cache[key] = icon;
+                TouchLru(key);
+                TrimCache();
+            }
 
             return icon;
         }
@@ -263,6 +329,7 @@ namespace DesktopIconManager.UI
                 }
             }
             _cache.Clear();
+            _lru.Clear();
         }
     }
 }

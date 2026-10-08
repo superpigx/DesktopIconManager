@@ -70,6 +70,29 @@ namespace DesktopIconManager.UI
         private bool _locked;            // 图标锁定：锁定后禁止拖动，防误操作
         private bool _autoFit = true;    // 改动后自动收紧面板尺寸（自动补位）
 
+        // ---- 渲染链路复用（复盘 P0-1 / P1-8 / P1-9）----
+        /// <summary>预乘用的临时字节缓冲。复用，尺寸不变不重建。</summary>
+        private byte[] _blitBuffer;
+        /// <summary>复用的 GDI 内存 DC / DIBSection。每帧建销会有大量内核态往返。</summary>
+        private IntPtr _blitMemDc = IntPtr.Zero;
+        private IntPtr _blitBmp = IntPtr.Zero;
+        private IntPtr _blitBits = IntPtr.Zero;
+        private IntPtr _blitOld = IntPtr.Zero;
+        private int _blitW;
+        private int _blitH;
+        /// <summary>缓冲区刚重建 → 内容不可信，必须整屏重绘一次。</summary>
+        private bool _bufferDirty = true;
+        /// <summary>首帧是否已成功提交（用于合并 OnHandleCreated / OnShown 的重复渲染）。</summary>
+        private bool _firstRenderDone;
+
+        // ---- 脏矩形（P1-8）----
+        private readonly List<SnapGuide> _lastGuides = new List<SnapGuide>();
+        private int _lastCombineTarget = -1;
+        private Rectangle _pendingDirty;
+        private bool _hoverPending;
+        private Timer _hoverTimer;
+        private Timer _saveTimer;
+
         public DesktopOverlayForm(ThemePalette theme, GroupLayout layout, string layoutPath)
         {
             _theme = theme;
@@ -86,6 +109,11 @@ namespace DesktopIconManager.UI
             _snap.Enabled = cfg.SnapEnabled;
             _snap.Gap = cfg.SnapGap;
             _snap.Threshold = cfg.SnapThreshold;
+
+            // 性能开关（都可在设置文件里关掉，随时回退到保守路径）
+            _icons.MaxCache = cfg.IconCacheLimit;
+            _renderer.UseShadowCache = cfg.PerfCacheShadow;
+            _renderer.UseHaloCache = cfg.PerfCacheLabelHalo;
 
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.Manual;
@@ -140,32 +168,97 @@ namespace DesktopIconManager.UI
                 WriteLog("启用拖放失败，外部拖入功能不可用: " + ex.Message);
             }
 
+            // 悬停重绘节流定时器（P1-12）。只悬停时启用，拖拽不走这里。
+            try
+            {
+                int ms = AppSettings.Current.HoverThrottleMs;
+                if (ms > 0)
+                {
+                    _hoverTimer = new Timer();
+                    _hoverTimer.Interval = Math.Max(1, ms);
+                    _hoverTimer.Tick += OnHoverTimerTick;
+                }
+            }
+            catch
+            {
+                _hoverTimer = null;
+            }
+
+            // 布局落盘去抖定时器（P2-18）。间隔按设置，0 = 关闭去抖。
+            try
+            {
+                _saveTimer = new Timer();
+                _saveTimer.Tick += OnSaveTimerTick;
+            }
+            catch
+            {
+                _saveTimer = null;
+            }
+
             // 接管桌面：先隐藏系统图标，避免与自绘图标重叠
             DesktopToggler.HideIcons();
 
             Render();
         }
 
-        /// <summary>把内部异常写到 exe 同目录，便于无控制台时排查。</summary>
+        /// <summary>统一走 AppLog（带级别、轮转、环境头）。</summary>
         private static void WriteLog(string text)
         {
-            try
-            {
-                File.AppendAllText(
-                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "last-error.log"),
-                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + text + Environment.NewLine,
-                    System.Text.Encoding.UTF8);
-            }
-            catch
-            {
-                // 连日志都写不了就放弃
-            }
+            AppLog.Warn(text);
         }
 
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
-            Render();
+
+            // 冷启动省一整帧：OnHandleCreated 已经画过一次全屏
+            // （1080p 约 8MB 分配 + 207 万像素预乘，10~20ms）。
+            // 只有那次因为尺寸还没定而被跳过时，才在这里补一帧 ——
+            // 这样既省了一帧，又不会退化成"首屏空白"。
+            if (!_firstRenderDone) Render();
+        }
+
+        private void OnHoverTimerTick(object sender, EventArgs e)
+        {
+            if (_hoverTimer != null) _hoverTimer.Stop();
+            if (!_hoverPending) return;
+
+            _hoverPending = false;
+            Rectangle dirty = _pendingDirty;
+            _pendingDirty = Rectangle.Empty;
+
+            if (dirty.IsEmpty) Render();
+            else RenderRegion(dirty);
+        }
+
+        private void OnSaveTimerTick(object sender, EventArgs e)
+        {
+            if (_saveTimer != null) _saveTimer.Stop();
+            SaveIfDirty();
+        }
+
+        /// <summary>标记布局已改动，并按去抖设置安排落盘。</summary>
+        private void MarkDirty()
+        {
+            _dirty = true;
+            if (_saveTimer == null) return;
+
+            int ms = 0;
+            try { ms = AppSettings.Current.SaveDebounceMs; }
+            catch { }
+
+            if (ms <= 0) return;
+
+            try
+            {
+                _saveTimer.Stop();
+                _saveTimer.Interval = ms;
+                _saveTimer.Start();
+            }
+            catch
+            {
+                // 定时器起不来不影响功能，退出时仍会落盘
+            }
         }
 
         protected override void OnPaintBackground(PaintEventArgs e)
@@ -190,11 +283,20 @@ namespace DesktopIconManager.UI
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             _closing = true;
+
+            // 退出前必须把待落盘的改动写掉 —— 去抖定时器可能还有未触发的一轮
+            if (_saveTimer != null)
+            {
+                try { _saveTimer.Stop(); }
+                catch { }
+            }
             SaveIfDirty();
 
             // 关键安全步骤：无论如何都要还回系统桌面图标
             try { DesktopToggler.ShowIcons(); }
             catch { }
+
+            ReleaseBlitResources();
 
             if (_backBuffer != null)
             {
@@ -269,7 +371,7 @@ namespace DesktopIconManager.UI
         /// <summary>立即保存布局（供托盘菜单调用）。</summary>
         public void SaveLayoutNow()
         {
-            _dirty = true;   // 强制落盘一次，避免用户以为点了没反应
+            MarkDirty();   // 强制落盘一次，避免用户以为点了没反应
             SaveIfDirty();
         }
 
@@ -329,10 +431,20 @@ namespace DesktopIconManager.UI
             _snap.Threshold = s.SnapThreshold;
             _autoFit = s.AutoFit;
 
+            // 节流/去抖间隔随设置刷新；图标缓存上限同理
+            if (_hoverTimer != null)
+            {
+                int ms = s.HoverThrottleMs;
+                _hoverTimer.Interval = Math.Max(1, ms > 0 ? ms : 1);
+            }
+            if (_icons != null) _icons.MaxCache = s.IconCacheLimit;
+            if (_renderer != null) _renderer.UseShadowCache = s.PerfCacheShadow;
+            if (_renderer != null) _renderer.UseHaloCache = s.PerfCacheLabelHalo;
+
             // 尺寸变了要把现有面板重新收紧，否则图标会溢出或被裁
             if (sizesChanged) ResizeAllToContent();
 
-            _dirty = true;
+            MarkDirty();
             Render();
         }
 
@@ -455,7 +567,7 @@ namespace DesktopIconManager.UI
             _layout.Groups.Add(box);
             _layout.ResolveOverlaps(screen.Width);
 
-            _dirty = true;
+            MarkDirty();
             return orphans.Count;
         }
 
@@ -502,7 +614,7 @@ namespace DesktopIconManager.UI
             for (int i = 0; i < _layout.Groups.Count; i++)
                 AutoFitPanel(i);
 
-            _dirty = true;
+            MarkDirty();
             Render();
         }
 
@@ -578,7 +690,7 @@ namespace DesktopIconManager.UI
             _layout.Groups.Add(box);
             AutoFitPanel(_layout.Groups.Count - 1);
 
-            _dirty = true;
+            MarkDirty();
             Render();
         }
 
@@ -663,7 +775,7 @@ namespace DesktopIconManager.UI
             if (dstAfterRemove >= 0 && dstAfterRemove < _layout.Groups.Count)
                 AutoFitPanel(dstAfterRemove);
 
-            _dirty = true;
+            MarkDirty();
             Render();
             return true;
         }
@@ -745,7 +857,7 @@ namespace DesktopIconManager.UI
                     AutoFitPanel(dstIndex);
             }
 
-            _dirty = true;
+            MarkDirty();
             Render();
             return true;
         }
@@ -768,7 +880,7 @@ namespace DesktopIconManager.UI
             box.ActiveTab = box.Tabs.Count - 1;
 
             AutoFitPanel(gi);
-            _dirty = true;
+            MarkDirty();
             Render();
         }
 
@@ -783,7 +895,7 @@ namespace DesktopIconManager.UI
 
             box.ActiveTab = tabIndex;
             EnsureTabFits(gi);          // 新分类条目更多时先把面板撑开
-            _dirty = true;
+            MarkDirty();
             Render();
         }
 
@@ -797,7 +909,7 @@ namespace DesktopIconManager.UI
             if (!box.NextTab(step)) return;
 
             EnsureTabFits(gi);          // 新分类条目更多时先把面板撑开
-            _dirty = true;
+            MarkDirty();
             Render();
         }
 
@@ -830,7 +942,7 @@ namespace DesktopIconManager.UI
             AutoFitPanel(gi);
             AutoFitPanel(_layout.Groups.Count - 1);
 
-            _dirty = true;
+            MarkDirty();
             Render();
         }
 
@@ -862,7 +974,7 @@ namespace DesktopIconManager.UI
             if (box.ActiveTab >= box.Tabs.Count) box.ActiveTab = box.Tabs.Count - 1;
 
             AutoFitPanel(gi);
-            _dirty = true;
+            MarkDirty();
             Render();
         }
 
@@ -959,7 +1071,7 @@ namespace DesktopIconManager.UI
             // 摆不稳就交给既有的重叠消除兜底
             _layout.ResolveOverlaps(screen.Width);
 
-            _dirty = true;
+            MarkDirty();
             Render();
 
             MessageBox.Show(this,
@@ -1011,6 +1123,7 @@ namespace DesktopIconManager.UI
         /// 会把 GC 大对象堆打爆 —— 只在尺寸变化时重建。</summary>
         private Bitmap _backBuffer;
 
+        /// <summary>整屏重绘。任何「不知道具体哪里变了」的场景都走这里 —— 它是安全网。</summary>
         private void Render()
         {
             if (!IsHandleCreated || _closing) return;
@@ -1019,11 +1132,10 @@ namespace DesktopIconManager.UI
             int h = Height;
             if (w <= 0 || h <= 0) return;
 
-            if (_backBuffer == null || _backBuffer.Width != w || _backBuffer.Height != h)
-            {
-                if (_backBuffer != null) _backBuffer.Dispose();
-                _backBuffer = new Bitmap(w, h, PixelFormat.Format32bppArgb);
-            }
+            PerfStats.BeginFrame();
+
+            _origin = Location;      // 脏矩形计算依赖它，顺手保证不漂移
+            EnsureBackBuffer(w, h);
 
             using (Graphics g = Graphics.FromImage(_backBuffer))
             {
@@ -1035,7 +1147,276 @@ namespace DesktopIconManager.UI
                 DrawContent(g, w, h);
             }
 
-            BlitToWindow(_backBuffer, w, h);
+            Blit(_backBuffer, new Rectangle(0, 0, w, h));
+
+            _bufferDirty = false;
+            _firstRenderDone = true;
+
+            UpdateSceneStats();
+            PerfStats.EndFrame(false);
+        }
+
+        /// <summary>
+        /// 局部重绘 —— 只重画 dirty 区域并提交该区域（P1-8）。
+        ///
+        /// 拖动一个面板时，整屏 207 万像素里真正变化的只有面板前后两块，
+        /// 走局部可以省掉绝大部分拷贝 + 预乘 + 内核态往返。
+        ///
+        /// ★ 安全约束：
+        ///   1. dirty 必须覆盖「变化前」与「变化后」两块的并集，少一块就是残影
+        ///      （0.9.0 的重影事故就是这个族的问题）
+        ///   2. 缓冲区刚重建时内容不可信 → 强制退化为整屏
+        ///   3. 设置里 perfFullRedraw=1 或 perfDirtyRect=0 → 一律整屏
+        /// </summary>
+        private void RenderRegion(Rectangle dirty)
+        {
+            if (!IsHandleCreated || _closing) return;
+
+            int w = Width;
+            int h = Height;
+            if (w <= 0 || h <= 0) return;
+
+            EnsureBackBuffer(w, h);
+            _origin = Location;
+
+            bool partial = CanUseDirtyRect() && !_bufferDirty;
+
+            dirty.Intersect(new Rectangle(0, 0, w, h));
+            if (partial && (dirty.Width <= 0 || dirty.Height <= 0)) return;
+
+            if (!partial)
+            {
+                Render();
+                return;
+            }
+
+            PerfStats.BeginFrame();
+
+            try
+            {
+            using (Graphics g = Graphics.FromImage(_backBuffer))
+            {
+                // 局部清屏必须用 SourceCopy：默认 SourceOver 拿透明色去"叠"，
+                // 等于什么都没做 —— 这正是局部更新最容易踩的坑
+                CompositingMode oldMode = g.CompositingMode;
+                g.CompositingMode = CompositingMode.SourceCopy;
+                using (var clear = new SolidBrush(Color.Transparent))
+                {
+                    g.FillRectangle(clear, dirty);
+                }
+                g.CompositingMode = oldMode;
+
+                Region oldClip = g.Clip;
+                g.SetClip(dirty, CombineMode.Intersect);
+                try
+                {
+                    DrawContent(g, w, h);
+                }
+                finally
+                {
+                    g.SetClip(oldClip, CombineMode.Replace);
+                    oldClip.Dispose();
+                }
+            }
+
+                Blit(_backBuffer, dirty);
+                _firstRenderDone = true;
+            }
+            catch (Exception ex)
+            {
+                // 局部更新一旦出任何问题，**本次会话**直接降级为整屏重绘，
+                // 并记日志 —— 宁可慢一点，也不能让界面出错
+                _dirtyRectFailed = true;
+                AppLog.Error("局部重绘失败，本次会话降级为整屏重绘", ex);
+
+                _bufferDirty = true;
+                Render();
+                return;
+            }
+
+            PerfStats.EndFrame(true);
+        }
+
+        /// <summary>局部重绘出过错 → 本次会话不再尝试（进程级自愈，不用改设置）。</summary>
+        private bool _dirtyRectFailed;
+
+        /// <summary>是否允许走脏矩形。设置里保留一键回到整屏的开关。</summary>
+        private bool CanUseDirtyRect()
+        {
+            if (_dirtyRectFailed) return false;
+
+            try
+            {
+                AppSettings s = AppSettings.Current;
+                if (s == null) return false;
+                return s.PerfDirtyRect && !s.PerfFullRedraw;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void EnsureBackBuffer(int w, int h)
+        {
+            if (_backBuffer != null && _backBuffer.Width == w && _backBuffer.Height == h)
+                return;
+
+            if (_backBuffer != null)
+            {
+                _backBuffer.Dispose();
+                _backBuffer = null;
+            }
+
+            _backBuffer = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+
+            // 新缓冲区是脏的，且 GDI 资源尺寸也要跟着变
+            _bufferDirty = true;
+            ReleaseBlitResources();
+        }
+
+        /// <summary>记录场景规模，供 --stats 使用。</summary>
+        private void UpdateSceneStats()
+        {
+            try
+            {
+                int items = 0;
+                for (int i = 0; i < _layout.Groups.Count; i++)
+                    items += _layout.Groups[i].Items.Count;
+
+                PerfStats.GroupCount = _layout.Groups.Count;
+                PerfStats.ItemCount = items;
+                PerfStats.IconCacheCount = (_icons != null) ? _icons.CacheCount : 0;
+            }
+            catch
+            {
+                // 统计失败不影响渲染
+            }
+        }
+
+        // ============================================================
+        //  脏矩形计算
+        // ============================================================
+
+        /// <summary>投影 / 光晕会画到面板外侧，脏区必须外扩这么多才不会留残影。</summary>
+        private int ShadowMargin()
+        {
+            int m = 0;
+            if (_theme != null && _theme.DrawShadow)
+                m = Math.Max(_theme.ShadowDepth, _theme.ShadowOffsetY);
+            return m + 3;
+        }
+
+        private Rectangle InflatedLocal(Rectangle screenRect)
+        {
+            Rectangle r = ToLocal(screenRect);
+            r.Inflate(ShadowMargin(), ShadowMargin());
+            return r;
+        }
+
+        private static Rectangle Union(Rectangle a, Rectangle b)
+        {
+            if (a.IsEmpty) return b;
+            if (b.IsEmpty) return a;
+            return Rectangle.Union(a, b);
+        }
+
+        /// <summary>参考线在窗体坐标下的包围盒。</summary>
+        private Rectangle GuidesBounds(IList<SnapGuide> guides)
+        {
+            Rectangle r = Rectangle.Empty;
+            if (guides == null || guides.Count == 0) return r;
+
+            for (int i = 0; i < guides.Count; i++)
+            {
+                SnapGuide sg = guides[i];
+
+                if (sg.Vertical)
+                {
+                    int x = sg.Position - _origin.X;
+                    int y0 = sg.From - _origin.Y;
+                    int y1 = sg.To - _origin.Y;
+                    r = Union(r, new Rectangle(x - 2, Math.Min(y0, y1) - 2, 5,
+                                               Math.Abs(y1 - y0) + 5));
+                }
+                else
+                {
+                    int y = sg.Position - _origin.Y;
+                    int x0 = sg.From - _origin.X;
+                    int x1 = sg.To - _origin.X;
+                    r = Union(r, new Rectangle(Math.Min(x0, x1) - 2, y - 2,
+                                               Math.Abs(x1 - x0) + 5, 5));
+                }
+            }
+
+            return r;
+        }
+
+        /// <summary>
+        /// 拖动/缩放过程中按「上一帧位置 ∪ 本帧位置 ∪ 参考线 ∪ 组合高亮」更新。
+        /// 少算任何一块都会留残影，所以这里宁可多算。
+        /// </summary>
+        private void RenderDragFrame(Rectangle oldBounds, Rectangle newBounds)
+        {
+            Rectangle dirty = Union(InflatedLocal(oldBounds), InflatedLocal(newBounds));
+
+            dirty = Union(dirty, GuidesBounds(_lastGuides));
+            dirty = Union(dirty, GuidesBounds(_dragGuides));
+
+            if (_lastCombineTarget >= 0 && _lastCombineTarget < _layout.Groups.Count)
+                dirty = Union(dirty, InflatedLocal(_layout.Groups[_lastCombineTarget].Bounds));
+
+            if (_combineTarget >= 0 && _combineTarget < _layout.Groups.Count)
+                dirty = Union(dirty, InflatedLocal(_layout.Groups[_combineTarget].Bounds));
+
+            _lastGuides.Clear();
+            _lastGuides.AddRange(_dragGuides);
+            _lastCombineTarget = _combineTarget;
+
+            RenderRegion(dirty);
+        }
+
+        /// <summary>悬停变化：只有所在收纳盒内部会变，脏区就是那两个盒子。</summary>
+        private void RenderHoverFrame(int oldGroup, int newGroup)
+        {
+            Rectangle dirty = Rectangle.Empty;
+
+            if (oldGroup >= 0 && oldGroup < _layout.Groups.Count)
+                dirty = Union(dirty, InflatedLocal(_layout.Groups[oldGroup].Bounds));
+
+            if (newGroup >= 0 && newGroup < _layout.Groups.Count)
+                dirty = Union(dirty, InflatedLocal(_layout.Groups[newGroup].Bounds));
+
+            if (dirty.IsEmpty)
+            {
+                Render();
+                return;
+            }
+
+            // 节流窗口内又发生了新变化 → 把脏区累加起来，避免漏掉中间态
+            if (_hoverPending)
+            {
+                _pendingDirty = Union(_pendingDirty, dirty);
+                return;
+            }
+
+            if (_hoverTimer == null)
+            {
+                RenderRegion(dirty);
+                return;
+            }
+
+            _hoverPending = true;
+            _pendingDirty = dirty;
+            try
+            {
+                _hoverTimer.Stop();
+                _hoverTimer.Start();
+            }
+            catch
+            {
+                RenderRegion(dirty);
+            }
         }
 
         private void DrawContent(Graphics g, int w, int h)
@@ -1169,56 +1550,84 @@ namespace DesktopIconManager.UI
                 _renderer.DrawSnapGuides(g, _dragGuides, _origin);
         }
 
-        /// <summary>把位图按预乘 alpha 提交到分层窗口。</summary>
-        private void BlitToWindow(Bitmap bmp, int w, int h)
+        /// <summary>
+        /// 把位图的指定区域按预乘 alpha 提交到分层窗口。
+        ///
+        /// 三项复用（复盘 P0-1 + P1-9）：
+        ///   1. 临时 byte[] 复用 —— 原来是每帧 new，1080p 就是 8.3MB/帧进 LOH
+        ///   2. 内存 DC / DIBSection 复用 —— 原来是每帧 Create/Delete，
+        ///      GDI 对象churn 加内核态往返
+        ///   3. stride == w*4 时一次 Marshal.Copy 拷完，省掉上千次小拷贝
+        ///   4. 预乘走指针版（设置 perfFastBlit 可切回托管版做对照）
+        ///   5. 局部更新时只处理 dirty 区域 —— 拷贝量与预乘量都随区域缩小
+        /// </summary>
+        private void Blit(Bitmap bmp, Rectangle rect)
         {
+            if (bmp == null || rect.Width <= 0 || rect.Height <= 0) return;
+
             IntPtr screenDc = IntPtr.Zero;
-            IntPtr memDc = IntPtr.Zero;
-            IntPtr hBmp = IntPtr.Zero;
-            IntPtr oldBmp = IntPtr.Zero;
 
             try
             {
                 screenDc = OverlayNative.GetDC(IntPtr.Zero);
                 if (screenDc == IntPtr.Zero) return;
 
-                memDc = OverlayNative.CreateCompatibleDC(screenDc);
-                if (memDc == IntPtr.Zero) return;
+                // ★ 关键：GDI 资源**始终按整屏尺寸**分配。
+                // 若按脏区尺寸分配，脏区每帧大小都在变，DIBSection 就会被反复
+                // 重建 —— 反而比整屏重绘更糟。整屏分配一次，局部更新只填子区域。
+                if (!EnsureBlitResources(screenDc, bmp.Width, bmp.Height)) return;
 
-                var bmi = new OverlayNative.BITMAPINFO();
-                // 颜色表数组必须显式分配，否则 P/Invoke 编组会因空引用失败
-                bmi.bmiColors = new OverlayNative.RGBQUAD[256];
-                bmi.bmiHeader.biSize = (uint)Marshal.SizeOf(typeof(OverlayNative.BITMAPINFOHEADER));
-                bmi.bmiHeader.biWidth = w;
-                bmi.bmiHeader.biHeight = -h;   // 负数 = 自上而下
-                bmi.bmiHeader.biPlanes = 1;
-                bmi.bmiHeader.biBitCount = 32;
-                bmi.bmiHeader.biCompression = OverlayNative.BI_RGB;
+                int fullStride = _blitW * 4;
+                int rowBytes = rect.Width * 4;
+                bool wholeScreen = (rect.X == 0 && rect.Y == 0
+                                    && rect.Width == _blitW && rect.Height == _blitH);
 
-                IntPtr bits;
-                hBmp = OverlayNative.CreateDIBSection(memDc, ref bmi,
-                    OverlayNative.DIB_RGB_COLORS, out bits, IntPtr.Zero, 0);
-                if (hBmp == IntPtr.Zero || bits == IntPtr.Zero) return;
-
-                oldBmp = OverlayNative.SelectObject(memDc, hBmp);
-
-                // 取出 GDI+ 的直通 alpha 像素，逐行（兼容负 stride）
-                BitmapData bd = bmp.LockBits(new Rectangle(0, 0, w, h),
-                    ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-
-                int rowBytes = w * 4;
-                byte[] buf = new byte[rowBytes * h];
-
-                for (int y = 0; y < h; y++)
+                BitmapData bd = bmp.LockBits(rect, ImageLockMode.ReadOnly,
+                                             PixelFormat.Format32bppArgb);
+                try
                 {
-                    IntPtr rowPtr = (IntPtr)((long)bd.Scan0 + (long)y * bd.Stride);
-                    Marshal.Copy(rowPtr, buf, y * rowBytes, rowBytes);
-                }
-                bmp.UnlockBits(bd);
+                    if (wholeScreen && bd.Stride == rowBytes)
+                    {
+                        // 整屏：一次拷完 + 一次预乘，最快路径
+                        Marshal.Copy(bd.Scan0, _blitBuffer, 0, rowBytes * rect.Height);
+                        PremultiplyWhole(rowBytes * rect.Height);
+                    }
+                    else
+                    {
+                        // 局部：把脏区逐行填进整屏缓冲的对应位置
+                        for (int y = 0; y < rect.Height; y++)
+                        {
+                            IntPtr rowPtr = (IntPtr)((long)bd.Scan0 + (long)y * bd.Stride);
+                            int dest = (rect.Y + y) * fullStride + rect.X * 4;
 
-                // UpdateLayeredWindow 要求预乘 alpha
-                OverlayNative.Premultiply(buf, buf.Length);
-                Marshal.Copy(buf, 0, bits, buf.Length);
+                            Marshal.Copy(rowPtr, _blitBuffer, dest, rowBytes);
+
+                            if (UseFastBlit())
+                                OverlayNative.PremultiplyFast(_blitBuffer, dest, rowBytes);
+                            else
+                                OverlayNative.Premultiply(_blitBuffer, dest, rowBytes);
+                        }
+                    }
+                }
+                finally
+                {
+                    bmp.UnlockBits(bd);
+                }
+
+                // 提交：整屏一次拷完；局部只拷脏区在整屏缓冲里的那一段
+                if (wholeScreen)
+                {
+                    Marshal.Copy(_blitBuffer, 0, _blitBits, rowBytes * rect.Height);
+                }
+                else
+                {
+                    for (int y = 0; y < rect.Height; y++)
+                    {
+                        int src = (rect.Y + y) * fullStride + rect.X * 4;
+                        IntPtr dest = (IntPtr)((long)_blitBits + src);
+                        Marshal.Copy(_blitBuffer, src, dest, rowBytes);
+                    }
+                }
 
                 var blend = new OverlayNative.BLENDFUNCTION();
                 blend.BlendOp = OverlayNative.AC_SRC_OVER;
@@ -1226,23 +1635,108 @@ namespace DesktopIconManager.UI
                 blend.SourceConstantAlpha = 255;
                 blend.AlphaFormat = OverlayNative.AC_SRC_ALPHA;
 
-                var srcPt = new OverlayNative.POINT { X = 0, Y = 0 };
-                var size = new OverlayNative.SIZE { cx = w, cy = h };
-                var dstPt = new OverlayNative.POINT { X = Left, Y = Top };
+                var srcPt = new OverlayNative.POINT { X = rect.X, Y = rect.Y };
+                var size = new OverlayNative.SIZE { cx = rect.Width, cy = rect.Height };
+                var dstPt = new OverlayNative.POINT { X = Left + rect.X, Y = Top + rect.Y };
 
                 OverlayNative.UpdateLayeredWindow(Handle, screenDc, ref dstPt, ref size,
-                    memDc, ref srcPt, 0, ref blend, OverlayNative.ULW_ALPHA);
+                    _blitMemDc, ref srcPt, 0, ref blend, OverlayNative.ULW_ALPHA);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error("提交分层窗口失败", ex);
             }
             finally
             {
-                if (memDc != IntPtr.Zero)
-                {
-                    if (oldBmp != IntPtr.Zero) OverlayNative.SelectObject(memDc, oldBmp);
-                    if (hBmp != IntPtr.Zero) OverlayNative.DeleteObject(hBmp);
-                    OverlayNative.DeleteDC(memDc);
-                }
                 if (screenDc != IntPtr.Zero) OverlayNative.ReleaseDC(IntPtr.Zero, screenDc);
             }
+        }
+
+        /// <summary>整屏预乘（一次性处理整块）。</summary>
+        private void PremultiplyWhole(int length)
+        {
+            if (UseFastBlit())
+                OverlayNative.PremultiplyFast(_blitBuffer, 0, length);
+            else
+                OverlayNative.Premultiply(_blitBuffer, 0, length);
+        }
+
+        private static bool UseFastBlit()
+        {
+            try
+            {
+                AppSettings s = AppSettings.Current;
+                return s == null || s.PerfFastBlit;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>准备好与尺寸匹配的 GDI 资源；尺寸不变则直接复用。</summary>
+        private bool EnsureBlitResources(IntPtr screenDc, int w, int h)
+        {
+            if (_blitMemDc != IntPtr.Zero && _blitBmp != IntPtr.Zero
+                && _blitW == w && _blitH == h && _blitBuffer != null)
+                return true;
+
+            ReleaseBlitResources();
+
+            _blitMemDc = OverlayNative.CreateCompatibleDC(screenDc);
+            if (_blitMemDc == IntPtr.Zero) return false;
+
+            var bmi = new OverlayNative.BITMAPINFO();
+            // 颜色表数组必须显式分配，否则 P/Invoke 编组会因空引用失败
+            bmi.bmiColors = new OverlayNative.RGBQUAD[256];
+            bmi.bmiHeader.biSize = (uint)Marshal.SizeOf(typeof(OverlayNative.BITMAPINFOHEADER));
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h;   // 负数 = 自上而下
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = OverlayNative.BI_RGB;
+
+            IntPtr bits;
+            _blitBmp = OverlayNative.CreateDIBSection(_blitMemDc, ref bmi,
+                OverlayNative.DIB_RGB_COLORS, out bits, IntPtr.Zero, 0);
+
+            if (_blitBmp == IntPtr.Zero || bits == IntPtr.Zero)
+            {
+                ReleaseBlitResources();
+                return false;
+            }
+
+            _blitBits = bits;
+            _blitOld = OverlayNative.SelectObject(_blitMemDc, _blitBmp);
+
+            _blitBuffer = new byte[w * 4 * h];
+            _blitW = w;
+            _blitH = h;
+            return true;
+        }
+
+        private void ReleaseBlitResources()
+        {
+            if (_blitMemDc != IntPtr.Zero)
+            {
+                if (_blitOld != IntPtr.Zero)
+                {
+                    OverlayNative.SelectObject(_blitMemDc, _blitOld);
+                    _blitOld = IntPtr.Zero;
+                }
+                if (_blitBmp != IntPtr.Zero)
+                {
+                    OverlayNative.DeleteObject(_blitBmp);
+                    _blitBmp = IntPtr.Zero;
+                }
+                OverlayNative.DeleteDC(_blitMemDc);
+                _blitMemDc = IntPtr.Zero;
+            }
+
+            _blitBits = IntPtr.Zero;
+            _blitBuffer = null;
+            _blitW = 0;
+            _blitH = 0;
         }
 
         private Point _origin;
@@ -1463,7 +1957,7 @@ namespace DesktopIconManager.UI
                     AutoFitPanel(bgi);
                 }
 
-                _dirty = true;
+                MarkDirty();
                 Render();
                 return;
             }
@@ -1561,6 +2055,7 @@ namespace DesktopIconManager.UI
                 proposed = SnapEngine.ClampToScreen(proposed, screen,
                                                     120, HeaderHeightOf(box));
 
+                Rectangle before = box.Bounds;
                 box.Bounds = proposed;
 
                 // 落点是否压在别的盒头部 —— 会高亮，松手就组合
@@ -1569,8 +2064,8 @@ namespace DesktopIconManager.UI
                 _dragGuides.Clear();
                 _dragGuides.AddRange(_snap.Guides);
 
-                _dirty = true;
-                Render();
+                MarkDirty();
+                RenderDragFrame(before, proposed);
             }
             else if (_drag == DragMode.Resize && _dragGroup >= 0)
             {
@@ -1582,13 +2077,14 @@ namespace DesktopIconManager.UI
                 proposed = _snap.SnapResize(
                     proposed, OtherRects(_dragGroup), SystemInformation.VirtualScreen, 140, 80);
 
+                Rectangle before = _layout.Groups[_dragGroup].Bounds;
                 _layout.Groups[_dragGroup].Bounds = proposed;
 
                 _dragGuides.Clear();
                 _dragGuides.AddRange(_snap.Guides);
 
-                _dirty = true;
-                Render();
+                MarkDirty();
+                RenderDragFrame(before, proposed);
             }
             else if (_drag == DragMode.Item)
             {
@@ -1616,7 +2112,7 @@ namespace DesktopIconManager.UI
                     if (!combined && _dragGroup < _layout.Groups.Count)
                     {
                         _layout.Groups[_dragGroup].Bounds = _dragOriginRect;
-                        _dirty = true;
+                        MarkDirty();
                         Render();
                     }
                 }
@@ -1645,7 +2141,7 @@ namespace DesktopIconManager.UI
                         AutoFitPanel(_dragGroup);
                         AutoFitPanel(targetGroup);
 
-                        _dirty = true;
+                        MarkDirty();
                         Render();
                     }
                 }
@@ -1760,7 +2256,7 @@ namespace DesktopIconManager.UI
             if (added > 0)
             {
                 AutoFitPanel(gi);
-                _dirty = true;
+                MarkDirty();
                 Render();
             }
         }
@@ -1796,7 +2292,7 @@ namespace DesktopIconManager.UI
             if (gi >= 0)
             {
                 _layout.Groups[gi].Collapsed = !_layout.Groups[gi].Collapsed;
-                _dirty = true;
+                MarkDirty();
                 Render();
             }
         }
@@ -1806,6 +2302,18 @@ namespace DesktopIconManager.UI
         {
             GroupItem item = GetItem(groupIndex, itemIndex);
             if (item == null) return;
+
+            // 路径来自 groups.txt —— 属于外部数据。
+            // 交给 Shell 之前先做合法性校验，挡住「存档投毒」这一攻击面。
+            if (!PathSafety.IsPlausible(item.FullPath))
+            {
+                MessageBox.Show(this,
+                    "条目路径不合法，已拒绝打开：\n" + item.FullPath +
+                    "\n\n可能存档（groups.txt）已损坏或被修改。\n" +
+                    "可右键桌面空白处 →「清理已失效条目」来修。",
+                    "无法打开", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
             if (!ShellLauncher.Exists(item.FullPath))
             {
@@ -1842,6 +2350,7 @@ namespace DesktopIconManager.UI
         {
             GroupItem item = GetItem(groupIndex, itemIndex);
             if (item == null) return false;
+            if (!PathSafety.IsPlausible(item.FullPath)) return false;
 
             ShellContextMenu menu = null;
             try
@@ -1889,7 +2398,7 @@ namespace DesktopIconManager.UI
             if (item == null) return;
 
             _layout.Groups[groupIndex].Items.RemoveAt(itemIndex);
-            _dirty = true;
+            MarkDirty();
             Render();
         }
 
@@ -1934,6 +2443,8 @@ namespace DesktopIconManager.UI
             bool changed = (newGroup != _hoverGroup || newItem != _hoverItem
                             || newTab != _hoverTab || newGrip != _hoverGrip);
 
+            int prevGroup = _hoverGroup;
+
             _hoverGroup = newGroup;
             _hoverItem = newItem;
             _hoverTab = newTab;
@@ -1941,7 +2452,9 @@ namespace DesktopIconManager.UI
 
             UpdateCursor();
 
-            if (changed) Render();
+            // 悬停变化只影响「离开的盒子」与「进入的盒子」——
+            // 之前是整屏重绘，1080p 下每划过一次鼠标就是 8MB 拷贝 + 207 万像素预乘
+            if (changed) RenderHoverFrame(prevGroup, newGroup);
         }
 
         /// <summary>
@@ -2006,7 +2519,7 @@ namespace DesktopIconManager.UI
                 menu.Items.Add("重新归类此盒", null, delegate
                 {
                     int moved = box.ReclassifyInPlace(new Classifier());
-                    _dirty = true; Render();
+                    MarkDirty(); Render();
                     if (moved > 0) AutoFitPanel(gi);
                 });
 
@@ -2016,7 +2529,7 @@ namespace DesktopIconManager.UI
                 menu.Items.Add("折叠 / 展开", null, delegate
                 {
                     _layout.Groups[gi].Collapsed = !_layout.Groups[gi].Collapsed;
-                    _dirty = true; Render();
+                    MarkDirty(); Render();
                 });
 
                 // 组合 / 合并到其他收纳盒（也可以直接把标题栏拖到目标盒上）
@@ -2049,7 +2562,7 @@ namespace DesktopIconManager.UI
             {
                 if (_layout.ReclassifyAll(new Classifier()) > 0)
                 {
-                    _dirty = true;
+                    MarkDirty();
                     ResizeAllToContent();
                     Render();
                 }
@@ -2090,7 +2603,7 @@ namespace DesktopIconManager.UI
                 box.ViewMode = mode;
                 // 换布局后单元格尺寸变了，面板要重新收紧
                 AutoFitPanel(gi);
-                _dirty = true;
+                MarkDirty();
                 Render();
             };
             parent.DropDownItems.Add(item);
@@ -2234,7 +2747,7 @@ namespace DesktopIconManager.UI
                 if (string.IsNullOrEmpty(t)) return;
 
                 box.Tabs[tabIndex].Title = t;
-                _dirty = true;
+                MarkDirty();
                 Render();
             }
         }
@@ -2251,7 +2764,7 @@ namespace DesktopIconManager.UI
                     if (!string.IsNullOrEmpty(t))
                     {
                         _layout.Groups[gi].Title = t;
-                        _dirty = true;
+                        MarkDirty();
                         Render();
                     }
                 }
@@ -2268,7 +2781,7 @@ namespace DesktopIconManager.UI
                 240, 140);
 
             _layout.Groups.Add(box);
-            _dirty = true;
+            MarkDirty();
             Render();
         }
 
@@ -2284,7 +2797,7 @@ namespace DesktopIconManager.UI
             if (answer != DialogResult.Yes) return;
 
             _layout.Groups.RemoveAt(gi);
-            _dirty = true;
+            MarkDirty();
             Render();
         }
 
@@ -2300,14 +2813,14 @@ namespace DesktopIconManager.UI
             _layout.Groups.Clear();
             _layout.Groups.AddRange(rebuilt.Groups);
 
-            _dirty = true;
+            MarkDirty();
             Render();
         }
 
         private void PruneMissing()
         {
             int n = _layout.PruneMissing();
-            _dirty = true;
+            MarkDirty();
             Render();
 
             MessageBox.Show("已清理 " + n + " 个失效条目。", "完成");
@@ -2344,8 +2857,12 @@ namespace DesktopIconManager.UI
         {
             if (disposing)
             {
+                if (_hoverTimer != null) { _hoverTimer.Dispose(); _hoverTimer = null; }
+                if (_saveTimer != null) { _saveTimer.Dispose(); _saveTimer = null; }
                 if (_renderer != null) _renderer.Dispose();
                 if (_icons != null) _icons.Dispose();
+
+                ReleaseBlitResources();
             }
             base.Dispose(disposing);
         }
