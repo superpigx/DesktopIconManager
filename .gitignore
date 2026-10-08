@@ -1,0 +1,16 @@
+# 构建产物
+bin/
+obj/
+
+# 运行时数据（用户桌面布局与设置，不进版本库）
+bin/groups.txt
+bin/settings.txt
+bin/last-error.log
+groups.combined-backup.txt
+
+# IDE / 系统
+*.user
+*.suo
+.vs/
+Thumbs.db
+desktop.ini

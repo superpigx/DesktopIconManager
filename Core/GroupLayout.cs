@@ -1,0 +1,586 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Text;
+
+namespace DesktopIconManager.Core
+{
+    /// <summary>收纳盒内的一个条目。</summary>
+    public sealed class GroupItem
+    {
+        public string Name { get; set; }
+        public string FullPath { get; set; }
+        public bool IsDirectory { get; set; }
+
+        public GroupItem() { }
+
+        public GroupItem(string name, string fullPath, bool isDirectory)
+        {
+            Name = name;
+            FullPath = fullPath;
+            IsDirectory = isDirectory;
+        }
+    }
+
+    /// <summary>
+    /// 收纳盒内的一个「分类」—— 也就是面板顶部的一个标签页。
+    ///
+    /// 每个分类各自持有一份条目列表，互不干扰；
+    /// 切换标签只是换一份要显示的列表，不会移动任何文件。
+    /// </summary>
+    public sealed class FenceTab
+    {
+        public string Title { get; set; }
+        public List<GroupItem> Items { get; private set; }
+
+        public FenceTab()
+        {
+            Title = "新分类";
+            Items = new List<GroupItem>();
+        }
+
+        public FenceTab(string title)
+        {
+            Title = title;
+            Items = new List<GroupItem>();
+        }
+    }
+
+    /// <summary>
+    /// 收纳盒的显示布局。
+    ///
+    /// 参考实现里对应「Use icon or list layouts ... per-widget icon size override」，
+    /// 也就是同一个盒子可以按需切换成网格大图标、网格小图标或逐行列表。
+    /// </summary>
+    public enum BoxViewMode
+    {
+        /// <summary>大图标网格（默认）。</summary>
+        LargeIcons = 0,
+        /// <summary>小图标网格 —— 一屏能放下更多。</summary>
+        SmallIcons = 1,
+        /// <summary>列表 —— 每行一项，适合名字长的文件。</summary>
+        List = 2
+    }
+
+    /// <summary>
+    /// 一个收纳盒（面板）。内含 1..N 个分类（标签页）。
+    ///
+    /// 只有 1 个分类时外观与单一分组无异；
+    /// 把另一个盒子拖到它上面就变成多分类盒子，顶部出现标签页。
+    /// 二者可以随时拆开 —— 见 DesktopOverlayForm 的「拆出为独立收纳盒」。
+    /// </summary>
+    public sealed class FenceBox
+    {
+        /// <summary>
+        /// 一个收纳盒最多容纳的分类数。
+        /// 取自原程序的约束：「无法添加，收纳盒最多支持15个分类！」
+        /// </summary>
+        public const int MaxTabs = 15;
+
+        public Rectangle Bounds { get; set; }
+        public bool Collapsed { get; set; }
+
+        /// <summary>
+        /// 单盒锁定（标题栏的锁按钮）。锁定后该盒不可拖动、缩放，
+        /// 条目也不可拖出；双击打开与右键菜单照常。
+        /// 与窗体的全局锁定叠加 —— 任一为真即视为锁定。
+        /// </summary>
+        public bool Locked { get; set; }
+
+        /// <summary>显示布局（大图标 / 小图标 / 列表），逐盒独立。</summary>
+        public BoxViewMode ViewMode { get; set; }
+
+        public List<FenceTab> Tabs { get; private set; }
+
+        /// <summary>当前显示的标签页索引。越界会自动收敛到合法范围。</summary>
+        public int ActiveTab { get; set; }
+
+        public FenceBox()
+        {
+            Tabs = new List<FenceTab>();
+            Tabs.Add(new FenceTab());
+            ActiveTab = 0;
+            ViewMode = BoxViewMode.LargeIcons;
+            Bounds = new Rectangle(24, 24, 320, 240);
+            Collapsed = false;
+        }
+
+        /// <summary>当前分类。始终返回一个合法对象，永不返回 null。</summary>
+        public FenceTab Current
+        {
+            get
+            {
+                if (Tabs.Count == 0) Tabs.Add(new FenceTab());
+                if (ActiveTab < 0) ActiveTab = 0;
+                if (ActiveTab >= Tabs.Count) ActiveTab = Tabs.Count - 1;
+                return Tabs[ActiveTab];
+            }
+        }
+
+        /// <summary>当前分类的标题。等价于原程序的「分类名」。</summary>
+        public string Title
+        {
+            get { return Current.Title; }
+            set { Current.Title = value; }
+        }
+
+        /// <summary>当前分类的条目。切换标签即切换这里指向的列表。</summary>
+        public List<GroupItem> Items
+        {
+            get { return Current.Items; }
+        }
+
+        /// <summary>是否已组合成多分类（决定要不要画标签页）。</summary>
+        public bool IsGrouped
+        {
+            get { return Tabs.Count > 1; }
+        }
+
+        /// <summary>循环切到下一个分类。返回是否切换成功。</summary>
+        public bool NextTab(int step)
+        {
+            if (Tabs.Count < 2) return false;
+
+            int n = Tabs.Count;
+            int next = ((ActiveTab + step) % n + n) % n;
+            if (next == ActiveTab) return false;
+
+            ActiveTab = next;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// 分组布局模型 + 持久化。
+    ///
+    /// 文件格式 v2（制表符分隔，UTF-8，顺序解析）：
+    ///   # DIM-GROUPS v2
+    ///   G &lt;x&gt; &lt;y&gt; &lt;w&gt; &lt;h&gt; &lt;collapsed&gt; &lt;activeTab&gt; &lt;viewMode&gt;
+    ///   T &lt;tabTitle&gt;                    ← 当前盒子新增一个分类
+    ///   I &lt;isDir&gt; &lt;name&gt; &lt;fullPath&gt;     ← 追加到当前分类
+    ///
+    /// v1 格式（每盒单分类）仍可读取，会自动升级为「单分类盒子」：
+    ///   G &lt;title&gt; &lt;x&gt; &lt;y&gt; &lt;w&gt; &lt;h&gt; &lt;collapsed&gt;
+    ///   I &lt;boxIndex&gt; &lt;isDir&gt; &lt;name&gt; &lt;fullPath&gt;
+    ///
+    /// 选择自研文本格式而不用 JSON，是为了零依赖（.NET Framework 无内置 JSON）
+    /// 且便于人工查看与手改。
+    /// </summary>
+    public sealed class GroupLayout
+    {
+        private const string MarkerV1 = "# DIM-GROUPS v1";
+        private const string MarkerV2 = "# DIM-GROUPS v2";
+
+        /// <summary>
+        /// 面板最小尺寸。
+        ///
+        /// 必须让「创建布局」「载入布局」「自动收紧」三处用同一套下限，
+        /// 否则会出现尺寸不一致 —— 曾因此导致相邻面板重叠、
+        /// 半透明面板叠色，看起来像「标题栏颜色不统一」。
+        /// </summary>
+        public const int MinPanelWidth = 120;
+        public const int MinPanelHeight = 80;
+
+        public List<FenceBox> Groups { get; private set; }
+
+        public GroupLayout()
+        {
+            Groups = new List<FenceBox>();
+        }
+
+        public static string DefaultPath()
+        {
+            return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "groups.txt");
+        }
+
+        // ============================================================
+        //  保存 / 载入
+        // ============================================================
+
+        public void Save(string path)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine(MarkerV2);
+            sb.AppendLine("# time=" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+
+            foreach (FenceBox g in Groups)
+            {
+                sb.Append("G\t")
+                  .Append(g.Bounds.X).Append('\t')
+                  .Append(g.Bounds.Y).Append('\t')
+                  .Append(g.Bounds.Width).Append('\t')
+                  .Append(g.Bounds.Height).Append('\t')
+                  .Append(g.Collapsed ? "1" : "0").Append('\t')
+                  .Append(Math.Max(0, Math.Min(g.ActiveTab, g.Tabs.Count - 1)))
+                  .Append('\t').Append((int)g.ViewMode)
+                  .Append('\t').Append(g.Locked ? "1" : "0")
+                  .Append("\r\n");
+
+                foreach (FenceTab tab in g.Tabs)
+                {
+                    sb.Append("T\t").Append(Escape(tab.Title)).Append("\r\n");
+
+                    foreach (GroupItem it in tab.Items)
+                    {
+                        sb.Append("I\t")
+                          .Append(it.IsDirectory ? "1" : "0").Append('\t')
+                          .Append(Escape(it.Name)).Append('\t')
+                          .Append(Escape(it.FullPath))
+                          .Append("\r\n");
+                    }
+                }
+            }
+
+            string dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+
+            File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+        }
+
+        public static GroupLayout Load(string path)
+        {
+            var layout = new GroupLayout();
+            if (!File.Exists(path)) return layout;
+
+            string[] lines;
+            try { lines = File.ReadAllLines(path, Encoding.UTF8); }
+            catch { return layout; }
+
+            // 版本判定：宁可当作 v1 多算一遍，也不能把 v2 当 v1 解析
+            bool v2 = false;
+            foreach (string l in lines)
+            {
+                if (string.IsNullOrEmpty(l) || l[0] != '#') continue;
+                if (l.Trim() == MarkerV2) { v2 = true; break; }
+                if (l.Trim() == MarkerV1) { v2 = false; break; }
+            }
+
+            return v2 ? ParseV2(lines) : ParseV1(lines);
+        }
+
+        /// <summary>v2：G 起新盒 → T 起新分类 → I 追加条目，顺序解析。</summary>
+        private static GroupLayout ParseV2(string[] lines)
+        {
+            var layout = new GroupLayout();
+            FenceBox box = null;
+
+            foreach (string raw in lines)
+            {
+                if (string.IsNullOrEmpty(raw)) continue;
+                if (raw[0] == '#') continue;
+
+                string[] p = raw.Split('\t');
+
+                if (p[0] == "G" && p.Length >= 7)
+                {
+                    int x, y, w, h, active, view;
+                    if (!int.TryParse(p[1], out x)) continue;
+                    if (!int.TryParse(p[2], out y)) continue;
+                    if (!int.TryParse(p[3], out w)) continue;
+                    if (!int.TryParse(p[4], out h)) continue;
+                    if (!int.TryParse(p[6], out active)) active = 0;
+                    // 第 8 个字段（布局）是可选的：缺省视为大图标
+                    if (p.Length < 8 || !int.TryParse(p[7], out view)) view = 0;
+                    // 第 9 个字段（单盒锁定）可选：缺省不锁
+                    bool locked = p.Length >= 9 && p[8] == "1";
+
+                    box = new FenceBox();
+                    box.Tabs.Clear();          // 分类全部由 T 行建立
+                    box.Bounds = new Rectangle(x, y, Math.Max(40, w), Math.Max(40, h));
+                    box.Collapsed = p[5] == "1";
+                    box.ActiveTab = active;
+                    box.Locked = locked;
+                    box.ViewMode = (view == 1) ? BoxViewMode.SmallIcons
+                                 : (view == 2) ? BoxViewMode.List
+                                 : BoxViewMode.LargeIcons;
+
+                    layout.Groups.Add(box);
+                }
+                else if (p[0] == "T" && p.Length >= 2 && box != null)
+                {
+                    if (box.Tabs.Count >= FenceBox.MaxTabs) continue;
+                    box.Tabs.Add(new FenceTab(Unescape(p[1])));
+                }
+                else if (p[0] == "I" && p.Length >= 4 && box != null)
+                {
+                    FenceTab tab = box.Current;
+                    tab.Items.Add(new GroupItem(Unescape(p[2]), Unescape(p[3]), p[1] == "1"));
+                }
+            }
+
+            // 兜底：G 行后没有任何 T 行的盒子补一个空分类
+            foreach (FenceBox b in layout.Groups)
+                if (b.Tabs.Count == 0) b.Tabs.Add(new FenceTab("新分类"));
+
+            return layout;
+        }
+
+        /// <summary>v1：每盒只有一个分类，G 行里带标题。</summary>
+        private static GroupLayout ParseV1(string[] lines)
+        {
+            var layout = new GroupLayout();
+
+            foreach (string raw in lines)
+            {
+                if (string.IsNullOrEmpty(raw)) continue;
+                if (raw[0] == '#') continue;
+
+                string[] p = raw.Split('\t');
+
+                if (p[0] == "G" && p.Length >= 7)
+                {
+                    int x, y, w, h;
+                    if (!int.TryParse(p[2], out x)) continue;
+                    if (!int.TryParse(p[3], out y)) continue;
+                    if (!int.TryParse(p[4], out w)) continue;
+                    if (!int.TryParse(p[5], out h)) continue;
+
+                    // 不要把尺寸「放大到最小宽度」：
+                    // 存档里的尺寸就是当初的排版依据，放大反而会压到相邻面板。
+                    // 这里只留一个防损坏数据的下限，远小于任何正常尺寸。
+                    var box = new FenceBox();
+                    box.Tabs.Clear();
+                    box.Tabs.Add(new FenceTab(Unescape(p[1])));
+                    box.Bounds = new Rectangle(x, y, Math.Max(40, w), Math.Max(40, h));
+                    box.Collapsed = p[6] == "1";
+
+                    layout.Groups.Add(box);
+                }
+                else if (p[0] == "I" && p.Length >= 5)
+                {
+                    int gi;
+                    if (!int.TryParse(p[1], out gi)) continue;
+                    if (gi < 0 || gi >= layout.Groups.Count) continue;
+
+                    layout.Groups[gi].Items.Add(new GroupItem(
+                        Unescape(p[3]), Unescape(p[4]), p[2] == "1"));
+                }
+            }
+
+            return layout;
+        }
+
+        public static bool IsLayoutFile(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return false;
+                using (var r = new StreamReader(path, Encoding.UTF8))
+                {
+                    string first = r.ReadLine();
+                    if (first == null) return false;
+
+                    string t = first.Trim();
+                    return t == MarkerV1 || t == MarkerV2;
+                }
+            }
+            catch { return false; }
+        }
+
+        // ============================================================
+        //  由桌面内容构建默认分组
+        // ============================================================
+
+        /// <summary>
+        /// 首次运行时，按分类把桌面图标自动分好组。
+        /// 只读取文件系统，不触碰桌面。
+        /// </summary>
+        public static GroupLayout BuildDefault()
+        {
+            var classifier = new Classifier();
+            var reader = new DesktopIconReader(classifier);
+
+            IList<DesktopIcon> icons;
+            try { icons = reader.ReadIcons(); }
+            catch { icons = new List<DesktopIcon>(); }
+
+            var order = new[]
+            {
+                IconCategory.Folder, IconCategory.Document, IconCategory.Archive,
+                IconCategory.Image, IconCategory.Video, IconCategory.Audio,
+                IconCategory.Executable, IconCategory.Script, IconCategory.Shortcut,
+                IconCategory.WebLink, IconCategory.Other
+            };
+
+            var layout = new GroupLayout();
+            int x = 24, y = 24, rowH = 0;
+
+            foreach (IconCategory cat in order)
+            {
+                var members = new List<DesktopIcon>();
+                foreach (DesktopIcon ic in icons)
+                    if (ic.Category == cat) members.Add(ic);
+
+                if (members.Count == 0) continue;
+
+                members.Sort(delegate (DesktopIcon a, DesktopIcon b)
+                {
+                    return string.Compare(a.Name, b.Name, StringComparison.CurrentCulture);
+                });
+
+                var box = new FenceBox();
+                box.Title = Classifier.GetDisplayName(cat);
+
+                // 每行最多放几列，由设置决定（默认 5）
+                int perRow = AppSettings.Current.MaxColumns;
+                if (perRow < 1) perRow = 5;
+                const int itemW = 76, itemH = 82, pad = 6, titleH = 28;
+                int cols = Math.Min(members.Count, perRow);
+                int rows = (members.Count + perRow - 1) / perRow;
+
+                int w = cols * itemW + pad * 2;
+                int h = rows * itemH + titleH + pad * 2;
+
+                // 先按最小尺寸收敛，再据此定位。
+                // 若不定，定位间隔用原始宽度（可能只有 88px），
+                // 而载入时尺寸会被放到最小宽度 120px —— 结果相邻面板重叠，
+                // 半透明面板一叠色就看起来像「标题栏颜色不统一」。
+                if (w < MinPanelWidth) w = MinPanelWidth;
+                if (h < MinPanelHeight) h = MinPanelHeight;
+
+                // 简单的流式摆放，超出屏宽则换行
+                if (x + w > 1880 && x > 24)
+                {
+                    x = 24;
+                    y += rowH + 12;
+                    rowH = 0;
+                }
+
+                box.Bounds = new Rectangle(x, y, w, h);
+
+                foreach (DesktopIcon ic in members)
+                    box.Items.Add(new GroupItem(ic.Name, ic.FullPath, ic.IsDirectory));
+
+                layout.Groups.Add(box);
+
+                x += w + 12;
+                if (h > rowH) rowH = h;
+            }
+
+            return layout;
+        }
+
+        /// <summary>把布局里已不存在的条目剔除（文件被删/改名后清理）。</summary>
+        public int PruneMissing()
+        {
+            int removed = 0;
+
+            foreach (FenceBox g in Groups)
+            {
+                // 所有分类都要清理，不能只看当前分类
+                foreach (FenceTab tab in g.Tabs)
+                {
+                    for (int i = tab.Items.Count - 1; i >= 0; i--)
+                    {
+                        string p = tab.Items[i].FullPath;
+                        bool exists = false;
+                        try
+                        {
+                            exists = Directory.Exists(p) || File.Exists(p);
+                        }
+                        catch { exists = false; }
+
+                        if (!exists)
+                        {
+                            tab.Items.RemoveAt(i);
+                            removed++;
+                        }
+                    }
+                }
+            }
+
+            return removed;
+        }
+
+        // ============================================================
+        //  重叠消除
+        // ============================================================
+
+        /// <summary>
+        /// 消除面板之间的重叠。
+        ///
+        /// 为什么需要：早期版本存在尺寸口径不一致的缺陷，会把重叠坐标写进
+        /// groups.txt。重叠有两个害处 ——
+        ///   1. 半透明面板叠在一起会混色，观感上像「标题栏颜色不统一」
+        ///   2. 被压住的面板抓不到标题栏，无法拖动
+        ///
+        /// 做法很保守：只把「后来者」向右推，右边放不下就换行，不改变已有面板。
+        /// </summary>
+        /// <returns>被移动过的次数</returns>
+        public int ResolveOverlaps(int screenWidth)
+        {
+            if (screenWidth <= 0) screenWidth = 1920;
+            if (Groups.Count < 2) return 0;
+
+            int moved = 0;
+
+            for (int i = 1; i < Groups.Count; i++)
+            {
+                FenceBox g = Groups[i];
+                int guard = 0;
+
+                while (guard++ < 200)
+                {
+                    bool hit = false;
+                    for (int j = 0; j < i; j++)
+                    {
+                        if (Groups[j].Bounds.IntersectsWith(g.Bounds)) { hit = true; break; }
+                    }
+                    if (!hit) break;
+
+                    Rectangle r = g.Bounds;
+                    int nx = r.X + 16;
+
+                    if (nx + r.Width > screenWidth)
+                    {
+                        // 右侧放不下 → 换到下一行
+                        g.Bounds = new Rectangle(8, r.Y + r.Height + 8, r.Width, r.Height);
+                    }
+                    else
+                    {
+                        g.Bounds = new Rectangle(nx, r.Y, r.Width, r.Height);
+                    }
+
+                    moved++;
+                }
+            }
+
+            return moved;
+        }
+
+        // ============================================================
+        //  转义
+        // ============================================================
+
+        private static string Escape(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            return s.Replace("\\", "\\\\")
+                    .Replace("\t", "\\t")
+                    .Replace("\r", "\\r")
+                    .Replace("\n", "\\n");
+        }
+
+        private static string Unescape(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+
+            var sb = new StringBuilder(s.Length);
+            for (int i = 0; i < s.Length; i++)
+            {
+                if (s[i] == '\\' && i + 1 < s.Length)
+                {
+                    char n = s[i + 1];
+                    if (n == '\\') { sb.Append('\\'); i++; continue; }
+                    if (n == 't') { sb.Append('\t'); i++; continue; }
+                    if (n == 'r') { sb.Append('\r'); i++; continue; }
+                    if (n == 'n') { sb.Append('\n'); i++; continue; }
+                }
+                sb.Append(s[i]);
+            }
+            return sb.ToString();
+        }
+    }
+}
