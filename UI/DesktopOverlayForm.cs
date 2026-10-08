@@ -2001,6 +2001,15 @@ namespace DesktopIconManager.UI
                 menu.Items.Add("重命名当前分类", null, delegate { RenameGroup(gi); });
                 menu.Items.Add("新建分类", null, delegate { AddTab(gi); });
 
+                // 按分类规则把错位条目归回自己的 tab（exe 回「程序」这类），
+                // 组合结构不动，文件也不动
+                menu.Items.Add("重新归类此盒", null, delegate
+                {
+                    int moved = box.ReclassifyInPlace(new Classifier());
+                    _dirty = true; Render();
+                    if (moved > 0) AutoFitPanel(gi);
+                });
+
                 // 布局：大图标 / 小图标 / 列表，逐盒独立设置
                 AddViewMenu(menu, gi);
 
@@ -2036,6 +2045,15 @@ namespace DesktopIconManager.UI
             }
 
             menu.Items.Add("新建收纳盒", null, delegate { AddGroup(location); });
+            menu.Items.Add("重新归类全部盒子（保持组合）", null, delegate
+            {
+                if (_layout.ReclassifyAll(new Classifier()) > 0)
+                {
+                    _dirty = true;
+                    ResizeAllToContent();
+                    Render();
+                }
+            });
             menu.Items.Add("按分类重新分组", null, delegate { RebuildFromDesktop(); });
             menu.Items.Add("清理已失效条目", null, delegate { PruneMissing(); });
             menu.Items.Add(new ToolStripSeparator());

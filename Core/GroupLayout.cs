@@ -106,6 +106,88 @@ namespace DesktopIconManager.Core
             Collapsed = false;
         }
 
+        /// <summary>
+        /// 按分类规则把盒内条目在**盒内各分类之间**重新分配。
+        ///
+        /// 修复「exe 落进脚本配置 tab」这类错位：历史遗留或手动挪动的
+        /// 条目按规则归回自己的分类 tab；没有对应分类时自动新建
+        /// （不超 MaxTabs，放不下的并入最后一个 tab，绝不丢条目），
+        /// 重排后变空的分类随之删除。
+        /// 只调整 tab 归属，不移动任何文件 —— 组合结构保持不变。
+        /// 返回被挪动的条目数。
+        /// </summary>
+        public int ReclassifyInPlace(Classifier classifier)
+        {
+            if (classifier == null) return 0;
+
+            // 1. 收集全部条目
+            var all = new List<GroupItem>();
+            foreach (FenceTab t in Tabs) all.AddRange(t.Items);
+            if (all.Count == 0) return 0;
+
+            // 2. 按分类名分桶（规则外的 → 「未归类」桶）
+            var buckets = new Dictionary<string, List<GroupItem>>();
+            foreach (GroupItem it in all)
+            {
+                string name = Classifier.GetDisplayName(
+                    classifier.Classify(it.FullPath, it.IsDirectory));
+
+                List<GroupItem> bucket;
+                if (!buckets.TryGetValue(name, out bucket))
+                {
+                    bucket = new List<GroupItem>();
+                    buckets[name] = bucket;
+                }
+                bucket.Add(it);
+            }
+
+            // 3. 原有 tab 顺序优先：分类还在的复用原 tab（保持手动排序），
+            //    消失的分类连 tab 一起删除
+            var newTabs = new List<FenceTab>();
+            int moved = 0;
+
+            foreach (FenceTab old in Tabs)
+            {
+                List<GroupItem> bucket;
+                if (!buckets.TryGetValue(old.Title, out bucket)) continue;
+
+                // 原 tab 里属于该分类的条目保持原有相对顺序
+                var keep = new List<GroupItem>();
+                foreach (GroupItem it in old.Items)
+                    if (bucket.Contains(it)) keep.Add(it);
+
+                foreach (GroupItem it in bucket)
+                    if (!keep.Contains(it)) { keep.Add(it); moved++; }
+
+                old.Items.Clear();
+                old.Items.AddRange(keep);
+                newTabs.Add(old);
+                buckets.Remove(old.Title);
+            }
+
+            // 4. 缺失的分类新建 tab；超上限时并入最后一个 tab（不丢条目）
+            foreach (KeyValuePair<string, List<GroupItem>> kv in buckets)
+            {
+                if (newTabs.Count < MaxTabs)
+                {
+                    var tab = new FenceTab(kv.Key);
+                    tab.Items.AddRange(kv.Value);
+                    moved += kv.Value.Count;
+                    newTabs.Add(tab);
+                }
+                else
+                {
+                    var last = newTabs[newTabs.Count - 1];
+                    last.Items.AddRange(kv.Value);
+                    moved += kv.Value.Count;
+                }
+            }
+
+            Tabs = newTabs;
+            ActiveTab = 0;
+            return moved;
+        }
+
         /// <summary>当前分类。始终返回一个合法对象，永不返回 null。</summary>
         public FenceTab Current
         {
@@ -460,6 +542,15 @@ namespace DesktopIconManager.Core
             }
 
             return layout;
+        }
+
+        /// <summary>对每个盒执行盒内重新归类（保持组合结构）。返回挪动条目数。</summary>
+        public int ReclassifyAll(Classifier classifier)
+        {
+            int moved = 0;
+            foreach (FenceBox g in Groups)
+                moved += g.ReclassifyInPlace(classifier);
+            return moved;
         }
 
         /// <summary>把布局里已不存在的条目剔除（文件被删/改名后清理）。</summary>
