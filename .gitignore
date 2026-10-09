@@ -1,4 +1,4 @@
-# 构建产物
+﻿# 构建产物
 bin/
 obj/
 
@@ -9,6 +9,10 @@ bin/groups.txt
 bin/settings.txt
 bin/last-error.log
 groups.combined-backup.txt
+
+# docs/ 是本地技术文档（架构复盘 / 参考实现分析 / 逆向分析报告），
+# 含对第三方产品的分析与内部取舍记录，**仅本地保存，不进公开仓库**
+docs/
 
 # 本地归档（整理目录时暂存的旧文件）
 _old/
