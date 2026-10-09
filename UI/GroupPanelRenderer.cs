@@ -829,13 +829,15 @@ namespace DesktopIconManager.UI
 
         /// <summary>
         /// 画标题栏右侧的两个按钮：锁定（挂锁）与视图循环切换（三横线）。
-        /// 对应原版收纳盒标题栏的 🔒 / ☰。
         ///
-        /// 锁必须「一眼看出是锁着还是开着」—— 只换颜色是不够的，
-        /// 所以两种状态画的是两种**形状**：
-        ///   · 锁定：锁体实心填充 + 完整半圆锁梁（梁的两脚都扣进锁体）
-        ///   · 未锁：锁体空心 + 锁梁抬起并向右偏（梁与锁体是分开的）
-        /// 再叠一层主色底衬与悬停底衬，让「有没有锁」「能不能点」都有反馈。
+        /// 视觉原则（v0.9.7 重做）：**克制**。
+        /// 早先锁定态用 0xE8 的主色实心块，绿底 + 深色锁形，在标题栏上像贴了块
+        /// 膏药，越淡的主题越突兀。现在改成「极淡底 + 1px 细描边」：
+        ///   · 锁定：淡强调底（约 12% 不透明度）+ 强调色细框，锁形为强调色
+        ///   · 悬停：中性淡底（约 10%）+ 淡框，只提示「可点」，不抢视线
+        ///   · 常态：无底无框，只有一个安静的线性图标
+        /// 状态主要靠**形状**区分（锁梁闭合 / 抬起），颜色只是辅助 ——
+        /// 这样在任何主题、任何壁纸下都协调，且小尺寸下依然认得出。
         /// </summary>
         /// <param name="hoverButton">鼠标压在哪个按钮上（0=锁，1=视图），-1 表示无。</param>
         public void DrawTitleButtons(Graphics g, Rectangle bounds, bool locked, int hoverButton)
@@ -853,29 +855,41 @@ namespace DesktopIconManager.UI
                 bool hot = (i == hoverButton);
                 bool lockOn = (i == 0 && locked);
 
-                // ---- 底衬 ----
-                // 锁定：主色实底（最显眼，远远就能看出这个盒被锁了）
-                // 悬停：中性淡底（说明这里能点）
-                Color back = Color.Empty;
-                if (lockOn) back = Color.FromArgb(0xE8, _theme.Accent);
-                else if (hot) back = Color.FromArgb(0x30, _theme.TitleText);
+                // ---- 底：极淡 tint，绝不做实心块 ----
+                Color fill;
+                if (lockOn) fill = Color.FromArgb(0x1F, _theme.Accent);   // 约 12%
+                else if (hot) fill = Color.FromArgb(0x1A, _theme.TitleText);
+                else fill = Color.Empty;
 
-                if (back.A > 0)
+                if (fill.A > 0)
                 {
-                    using (var brush = new SolidBrush(back))
+                    using (var brush = new SolidBrush(fill))
                     {
-                        FillRoundedRect(g, brush, r, 3);
+                        FillRoundedRect(g, brush, Inflate(r, -1), 4);
                     }
                 }
 
-                // ---- 前景色 ----
-                // 锁定时要保证与主色底的对比度：主色偏亮就用深字，偏暗就用白字
-                Color ink;
-                if (lockOn) ink = IsLight(_theme.Accent) ? Color.FromArgb(0xFF, 0x18, 0x1C, 0x20)
-                                                         : Color.FromArgb(0xFF, 0xFF, 0xFF, 0xFF);
-                else ink = hot ? _theme.TitleText : Color.FromArgb(0xC4, _theme.TitleText);
+                // ---- 框：1px 细线，锁定用强调色，悬停用中性 ----
+                Color edge;
+                if (lockOn) edge = Color.FromArgb(0x9E, _theme.Accent);
+                else if (hot) edge = Color.FromArgb(0x59, _theme.TitleText);
+                else edge = Color.Empty;
 
-                using (var pen = new Pen(ink, 1.6f))
+                if (edge.A > 0)
+                {
+                    using (var pen = new Pen(edge, 1f))
+                    {
+                        DrawRoundedRect(g, pen, Inflate(r, -1), 4);
+                    }
+                }
+
+                // ---- 图形 ----
+                Color ink;
+                if (lockOn) ink = _theme.Accent;                        // 细而清楚，不再是反色块
+                else if (hot) ink = _theme.TitleText;
+                else ink = Color.FromArgb(0xA8, _theme.TitleText);
+
+                using (var pen = new Pen(ink, 1.5f))
                 {
                     pen.StartCap = LineCap.Round;
                     pen.EndCap = LineCap.Round;
@@ -883,36 +897,46 @@ namespace DesktopIconManager.UI
                     if (i == 0) DrawLockGlyph(g, pen, r, locked);
                     else
                     {
-                        // 视图切换：三条横线
+                        // 视图切换：三条横线（当前模式下加一条主色短线做「进度」暗示）
                         for (int k = 0; k < 3; k++)
                         {
                             int ly = r.Y + 4 + k * 5;
-                            g.DrawLine(pen, r.X + 4, ly, r.X + r.Width - 4, ly);
+                            g.DrawLine(pen, r.X + 5, ly, r.X + r.Width - 5, ly);
                         }
                     }
                 }
             }
         }
 
+        /// <summary>按钮底衬用的内缩矩形（描边落在边框内侧，避免被面板裁掉）。</summary>
+        private static Rectangle Inflate(Rectangle r, int d)
+        {
+            r.X += d; r.Y += d;
+            r.Width -= d * 2; r.Height -= d * 2;
+            if (r.Width < 1) r.Width = 1;
+            if (r.Height < 1) r.Height = 1;
+            return r;
+        }
+
         /// <summary>
-        /// 挂锁图形。锁定 = 实心锁体 + 扣紧的锁梁；未锁 = 空心锁体 + 抬起并右偏的锁梁。
-        /// 两种状态形状不同，颜色之外还能靠轮廓区分（色弱/小尺寸下也认得出）。
+        /// 挂锁图形。锁定 = 锁梁扣进锁体（闭合半圆 + 实心锁体）；
+        /// 未锁 = 锁梁抬起右偏、锁体空心。形状差异是状态的主要传达方式。
         /// </summary>
         private void DrawLockGlyph(Graphics g, Pen pen, Rectangle r, bool locked)
         {
-            int bw = 10;
+            int bw = 9;
             int bx = r.X + (r.Width - bw) / 2;
-            int by = r.Y + r.Height - 9;   // 锁体贴着按钮下沿，上方留给锁梁
+            int by = r.Y + r.Height - 8;   // 锁体贴着按钮下沿，上方留给锁梁
 
             if (locked)
             {
                 // 锁梁：完整半圆，两脚垂直落进锁体 —— 「扣上了」
                 g.DrawArc(pen, bx + 1, by - 7, bw - 2, 9, 180, 180);
 
-                // 锁体：填实心，一眼就是「锁住了」
+                // 锁体：实心，一眼就是「锁住了」
                 using (var brush = new SolidBrush(pen.Color))
                 {
-                    g.FillRectangle(brush, bx, by, bw, 7);
+                    g.FillRectangle(brush, bx, by, bw, 6);
                 }
             }
             else
@@ -921,29 +945,27 @@ namespace DesktopIconManager.UI
                 g.DrawArc(pen, bx + 4, by - 8, bw - 2, 9, 178, 150);
 
                 // 锁体：空心
-                g.DrawRectangle(pen, bx, by, bw, 7);
+                g.DrawRectangle(pen, bx, by, bw, 6);
             }
-        }
-
-        /// <summary>颜色是否偏亮（用于在有色底上选黑字还是白字）。</summary>
-        private static bool IsLight(Color c)
-        {
-            return (c.R * 299 + c.G * 587 + c.B * 114) / 1000 >= 150;
         }
 
         /// <summary>
         /// 标题栏左端的小锁标记 —— 锁定时才有。
         ///
-        /// 光靠右上角按钮，扫一眼桌面看不出哪个盒被锁了；
+        /// 右上角的锁按钮太小，扫一眼桌面看不出哪个盒被锁了；
         /// 在标题最左侧再放一个，视线不用找就知道状态。
+        /// 刻意画得很轻（半透明细线、小尺寸），它只是「状态提示」，
+        /// 不该在标题栏里抢注意力 —— 抢了就变成噪声。
         /// </summary>
         private void DrawLockBadge(Graphics g, Rectangle titleRect)
         {
-            int size = 8;
-            int x = titleRect.X + 6;
+            int size = 7;
+            int x = titleRect.X + 7;
             int y = titleRect.Y + (titleRect.Height - size) / 2;
 
-            using (var pen = new Pen(Color.FromArgb(0xD8, _theme.Accent), 1.3f))
+            Color ink = Color.FromArgb(0x8C, _theme.Accent);
+
+            using (var pen = new Pen(ink, 1.1f))
             {
                 pen.StartCap = LineCap.Round;
                 pen.EndCap = LineCap.Round;
@@ -1295,12 +1317,18 @@ namespace DesktopIconManager.UI
 
         private void DrawRoundedRect(Graphics g, Pen pen, Rectangle r)
         {
-            if (_theme.PanelRadius <= 0)
+            DrawRoundedRect(g, pen, r, _theme.PanelRadius);
+        }
+
+        /// <summary>指定圆角半径的圆角描边（小控件用，避免跟着面板的大圆角走）。</summary>
+        private void DrawRoundedRect(Graphics g, Pen pen, Rectangle r, int radius)
+        {
+            if (radius <= 0)
             {
-                g.DrawRectangle(pen, r.X, r.Y, r.Width - 1, r.Height - 1);
+                g.DrawRectangle(pen, r.X, r.Y, Math.Max(1, r.Width - 1), Math.Max(1, r.Height - 1));
                 return;
             }
-            using (GraphicsPath path = RoundedPath(r, _theme.PanelRadius))
+            using (GraphicsPath path = RoundedPath(r, radius))
             {
                 g.DrawPath(pen, path);
             }

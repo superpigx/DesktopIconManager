@@ -6,12 +6,52 @@ using System.Text;
 
 namespace DesktopIconManager.Core
 {
-    /// <summary>收纳盒内的一个条目。</summary>
+    /// <summary>
+    /// 收纳盒内条目的排序方式。
+    ///
+    /// Manual = 不排序，保持用户拖放出来的顺序（默认，也是手工排版的前提）。
+    /// 其余按属性自动排序；再点一次同一项切换升/降序。
+    /// </summary>
+    public enum BoxSortMode
+    {
+        Manual = 0,
+        Name = 1,          // 名称
+        Kind = 2,          // 类型（文件夹 / 脚本 / 压缩 / 文档…）
+        Size = 3,          // 大小
+        Modified = 4       // 修改时间
+    }
+
+    /// <summary>排序方式的中文名，供菜单与诊断输出使用。</summary>
+    public static class BoxSortModes
+    {
+        public static string GetDisplayName(BoxSortMode mode)
+        {
+            switch (mode)
+            {
+                case BoxSortMode.Name: return "按名称";
+                case BoxSortMode.Kind: return "按类型";
+                case BoxSortMode.Size: return "按大小";
+                case BoxSortMode.Modified: return "按修改时间";
+                default: return "手动顺序";
+            }
+        }
+    }
+
+    /// <summary>
+    /// 收纳盒内的一个条目。
+    /// </summary>
     public sealed class GroupItem
     {
         public string Name { get; set; }
         public string FullPath { get; set; }
         public bool IsDirectory { get; set; }
+
+        // ---- 排序用的惰性元数据缓存（不进存档）----
+        // 按大小 / 修改时间排序需要读文件系统。桌面常有上百条目，
+        // 每帧 stat 一次会把渲染拖死 —— 所以只取一次，缓存在条目上。
+        private long _size = -1;
+        private DateTime _modified = DateTime.MinValue;
+        private bool _metaResolved;
 
         public GroupItem() { }
 
@@ -20,6 +60,63 @@ namespace DesktopIconManager.Core
             Name = name;
             FullPath = fullPath;
             IsDirectory = isDirectory;
+        }
+
+        /// <summary>文件大小（字节）。文件夹没有明确大小，返回 -1。</summary>
+        public long Size
+        {
+            get
+            {
+                ResolveMeta();
+                return _size;
+            }
+        }
+
+        /// <summary>最后写入时间。取不到时返回 <see cref="DateTime.MinValue"/>。</summary>
+        public DateTime Modified
+        {
+            get
+            {
+                ResolveMeta();
+                return _modified;
+            }
+        }
+
+        /// <summary>
+        /// 取一次文件元数据并缓存。
+        ///
+        /// 只在排序需要时触发，且**任何异常都吞掉** —— 排序失败顶多退回默认顺序，
+        /// 绝不能让一次 stat 异常打断整帧渲染。
+        /// </summary>
+        private void ResolveMeta()
+        {
+            if (_metaResolved) return;
+            _metaResolved = true;      // 先置位：即使抛异常也不反复重试
+
+            if (string.IsNullOrEmpty(FullPath)) return;
+
+            try
+            {
+                if (IsDirectory) return;
+
+                var fi = new FileInfo(FullPath);
+                if (!fi.Exists) return;
+
+                _size = fi.Length;
+                _modified = fi.LastWriteTime;
+            }
+            catch
+            {
+                // 无权限 / 已删除 / 网络路径不可达 —— 保持默认值
+            }
+        }
+
+        /// <summary>条目内容变化后让缓存失效（目前只在条目被重建时天然发生）。</summary>
+        public void InvalidateMeta()
+        {
+            _metaResolved = false;
+            _size = -1;
+            _modified = DateTime.MinValue;
         }
     }
 
@@ -103,6 +200,124 @@ namespace DesktopIconManager.Core
         /// 存档里不写这一列就等于 null，老存档天然兼容。
         /// </summary>
         public BoxViewMode? ViewMode { get; set; }
+
+        /// <summary>
+        /// **该分类自己的**条目排序方式；默认手动（保持拖放出来的顺序）。
+        ///
+        /// 逐分类独立（与显示方式同理）：文件夹按名称排、快捷方式按大小排，
+        /// 互不干扰。组合成格子组后各自保持自己的排法。
+        /// </summary>
+        public BoxSortMode SortMode { get; set; }
+
+        /// <summary>是否降序（仅对非 Manual 有意义）。再点一次同一模式即切换方向。</summary>
+        public bool SortDescending { get; set; }
+
+        // ---- 排序结果缓存（不进存档）----
+        // 渲染每帧都要用顺序表，不能每帧都排序；条目增删会让 Items.Count 变化，
+        // 缓存签名因此自动失效，无需到处手动清。
+        private int[] _sortOrder;
+        private int _sortStamp;
+
+        /// <summary>
+        /// 渲染 / 命中测试要用的**原始索引顺序**。
+        ///
+        /// 返回的数组是「显示位置 → box.Items 里的下标」的映射，
+        /// 排序方式为手动时就是 0,1,2,… 的直通顺序（零开销）。
+        /// </summary>
+        public int[] GetSortOrder()
+        {
+            int n = Items.Count;
+
+            if (SortMode == BoxSortMode.Manual || n <= 1)
+                return StraightOrder(n);
+
+            int stamp = unchecked((int)((int)SortMode * 397) ^ (n * 31)
+                                  ^ (SortDescending ? 0x5A5A : 0x1234));
+            if (_sortOrder != null && _sortStamp == stamp && _sortOrder.Length == n)
+                return _sortOrder;
+
+            var order = new int[n];
+            for (int i = 0; i < n; i++) order[i] = i;
+
+            // 稳定排序：同值时保持原顺序，避免每次渲染条目位置乱跳
+            var keys = new long[n];
+            var text = new string[n];
+            var dirs = new bool[n];
+            var cats = new IconCategory[n];
+
+            // Classifier 构造要重建整张规则表，**绝不能**放进比较器里逐次 new。
+            // 每次排序建一个实例，分类结果预计算进数组。
+            Classifier cls = null;
+            if (SortMode == BoxSortMode.Kind)
+            {
+                try { cls = new Classifier(); }
+                catch { cls = null; }   // 规则读不到就退回按名称排
+            }
+
+            for (int i = 0; i < n; i++)
+            {
+                GroupItem it = Items[i];
+                dirs[i] = it.IsDirectory;
+
+                switch (SortMode)
+                {
+                    case BoxSortMode.Size:
+                        keys[i] = it.Size;
+                        break;
+                    case BoxSortMode.Modified:
+                        keys[i] = it.Modified.Ticks;
+                        break;
+                    default:
+                        keys[i] = 0;
+                        break;
+                }
+
+                text[i] = it.Name ?? string.Empty;
+
+                if (cls != null)
+                {
+                    try { cats[i] = cls.Classify(it.FullPath, it.IsDirectory); }
+                    catch { cats[i] = IconCategory.Other; }
+                }
+            }
+
+            Array.Sort(order, delegate (int a, int b)
+            {
+                // 文件夹恒排在文件之前（两种方向都如此）—— 目录最常用，这个不该翻
+                if (dirs[a] != dirs[b]) return dirs[a] ? -1 : 1;
+
+                int c = 0;
+
+                switch (SortMode)
+                {
+                    case BoxSortMode.Size:
+                    case BoxSortMode.Modified:
+                        c = keys[a].CompareTo(keys[b]);
+                        break;
+                    case BoxSortMode.Kind:
+                        c = cats[a].CompareTo(cats[b]);
+                        break;
+                    default:
+                        c = string.Compare(text[a], text[b],
+                                           StringComparison.CurrentCultureIgnoreCase);
+                        break;
+                }
+
+                if (SortDescending) c = -c;
+                return c != 0 ? c : a.CompareTo(b);   // 稳定性兜底
+            });
+
+            _sortOrder = order;
+            _sortStamp = stamp;
+            return order;
+        }
+
+        private static int[] StraightOrder(int n)
+        {
+            var a = new int[n];
+            for (int i = 0; i < n; i++) a[i] = i;
+            return a;
+        }
 
         public FenceTab()
         {
@@ -482,11 +697,16 @@ namespace DesktopIconManager.Core
                           .Append('\t').Append(o.Collapsed ? "1" : "0");
                     }
 
-                    // 再往后：分类自己的显示方式（第 10 列）。
-                    // 同样是可选的 —— 没单独设置过就不写这一列，行长度保持不变，
-                    // 老 exe 照常能读（它会忽略多出来的字段）。
+                    // 再往后：分类自己的显示方式（第 10 列）、排序方式（第 11、12 列）。
+                    // 同样是可选的 —— 没设置过就不写，行长度与老版本一致。
                     if (tab.ViewMode.HasValue)
                         sb.Append('\t').Append((int)tab.ViewMode.Value);
+
+                    if (tab.SortMode != BoxSortMode.Manual)
+                    {
+                        sb.Append('\t').Append((int)tab.SortMode)
+                          .Append('\t').Append(tab.SortDescending ? "1" : "0");
+                    }
 
                     sb.Append("\r\n");
 
@@ -635,6 +855,18 @@ namespace DesktopIconManager.Core
                             tab.ViewMode = (tv == 1) ? BoxViewMode.SmallIcons
                                          : (tv == 2) ? BoxViewMode.List
                                          : BoxViewMode.LargeIcons;
+                        }
+                    }
+
+                    // 第 11、12 列（可选）：本分类的排序方式与方向。
+                    // 两列一起判定 —— 只写模式没写方向时按升序处理。
+                    if (p.Length >= 11)
+                    {
+                        int sm;
+                        if (int.TryParse(p[10], out sm) && sm >= 0 && sm <= 4)
+                        {
+                            tab.SortMode = (BoxSortMode)sm;
+                            tab.SortDescending = (p.Length >= 12 && p[11] == "1");
                         }
                     }
 

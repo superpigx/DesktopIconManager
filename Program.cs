@@ -1108,6 +1108,9 @@ namespace DesktopIconManager
                             + "  容量 " + cols + "×" + rows + "=" + capacity
                             + "  显示=" + ViewName(vmode)
                             + (t.ViewMode.HasValue ? "(独立)" : "(跟盒)")
+                            + "  排序=" + BoxSortModes.GetDisplayName(t.SortMode)
+                            + (t.SortMode == BoxSortMode.Manual ? ""
+                                : (t.SortDescending ? "(降序)" : "(升序)"))
                             + flag);
 
                         if (t.Items.Count > capacity)

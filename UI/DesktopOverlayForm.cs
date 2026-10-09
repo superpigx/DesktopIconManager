@@ -670,15 +670,23 @@ namespace DesktopIconManager.UI
             return _renderer.HeaderHeight(box.Tabs.Count);
         }
 
-        /// <summary>某个条目在窗体坐标下的矩形。</summary>
+        /// <summary>
+        /// 按**显示位**（第 k 格）取矩形 —— 绘制与命中测试用，
+        /// 位置口径必须与 GetItemBounds 的调用方一致。
+        /// </summary>
+        private Rectangle ItemBoundsAt(int groupIndex, int displayIndex)
+        {
+            FenceBox box = _layout.Groups[groupIndex];
+            return _renderer.GetItemBounds(
+                ToLocal(box.Bounds), HeaderHeightOf(box),
+                box.CurrentViewMode, displayIndex);
+        }
+
+        /// <summary>按**原始下标**取矩形。条目增删时用（画删除高亮之类）。</summary>
         private Rectangle ItemBoundsOf(int groupIndex, int itemIndex)
         {
             FenceBox box = _layout.Groups[groupIndex];
-            // 用分类自己的有效显示方式（没单独设置就跟盒）——
-            // 组合成格子组后各分类布局独立，全靠这一处
-            return _renderer.GetItemBounds(
-                ToLocal(box.Bounds), HeaderHeightOf(box),
-                box.CurrentViewMode, itemIndex);
+            return ItemBoundsAt(groupIndex, itemIndex);
         }
 
         /// <summary>收集分类标题，供渲染使用；未组合时返回 null。</summary>
@@ -1920,6 +1928,11 @@ namespace DesktopIconManager.UI
                 BoxViewMode itemView = box.CurrentViewMode;
                 bool listMode = (itemView == BoxViewMode.List);
 
+                // 条目顺序：排序方式是分类级设置，这里拿到「显示位 → 原始索引」的映射。
+                // 绘制位置用显示位 k，取条目用原始下标 order[k] —— 两者的差别
+                // 就是「用户看到的第 3 个」和「Items[3]」不是同一个东西。
+                int[] order = box.Current.GetSortOrder();
+
                 // 把条目裁剪在面板内。
                 //
                 // 面板被拖小、或当前分类条目多于装得下的数量时，
@@ -1936,21 +1949,22 @@ namespace DesktopIconManager.UI
 
                 try
                 {
-                    for (int i = 0; i < box.Items.Count; i++)
+                    for (int k = 0; k < box.Items.Count; k++)
                     {
                         Rectangle itemRect = _renderer.GetItemBounds(
-                            bounds, headerH, itemView, i);
+                            bounds, headerH, itemView, k);
 
                         if (!itemRect.IntersectsWith(body)) continue;
 
-                        GroupItem item = box.Items[i];
+                        GroupItem item = box.Items[order[k]];
 
                         Icon icon = null;
                         try { icon = _icons.GetIcon(item.FullPath, item.IsDirectory); }
                         catch { }
 
+                        // 悬停高亮按原始下标比对 —— _hoverItem 一直是原始下标
                         ItemState state = ItemState.Normal;
-                        if (gi == _hoverGroup && i == _hoverItem) state = ItemState.Hover;
+                        if (gi == _hoverGroup && order[k] == _hoverItem) state = ItemState.Hover;
 
                         if (listMode)
                         {
@@ -2328,12 +2342,16 @@ namespace DesktopIconManager.UI
                 Rectangle b = ToLocal(box.Bounds);
                 if (!b.Contains(p)) continue;
 
-                for (int i = 0; i < box.Items.Count; i++)
+                // 命中必须和绘制用同一套顺序，否则会出现
+                // 「高亮在 A 上、点下去却是 B」—— 位置用显示位、回传原始下标
+                int[] order = box.Current.GetSortOrder();
+
+                for (int k = 0; k < box.Items.Count; k++)
                 {
-                    if (ItemBoundsOf(gi, i).Contains(p))
+                    if (ItemBoundsAt(gi, k).Contains(p))
                     {
                         groupIndex = gi;
-                        itemIndex = i;
+                        itemIndex = order[k];
                         return true;
                     }
                 }
@@ -3197,8 +3215,9 @@ namespace DesktopIconManager.UI
                     if (moved > 0) AutoFitPanel(gi);
                 });
 
-                // 布局：大图标 / 小图标 / 列表，逐盒独立设置
+                // 布局与排序：都是**逐分类独立**设置，组合后互不干扰
                 AddViewMenu(menu, gi);
+                AddSortMenu(menu, gi);
 
                 menu.Items.Add("折叠 / 展开", null, delegate
                 {
@@ -3304,6 +3323,88 @@ namespace DesktopIconManager.UI
                 ApplyViewMode(gi, mode);
             };
             parent.DropDownItems.Add(item);
+        }
+
+        /// <summary>
+        /// 右键菜单「排序方式」子菜单 —— **逐分类独立**（与显示方式同一思路）。
+        ///
+        /// 再点一次同一项即切换升/降序；选「手动顺序」回到拖放出来的原序。
+        /// 排序只影响显示顺序，不改数据，也不移动任何文件。
+        /// </summary>
+        private void AddSortMenu(ContextMenuStrip menu, int gi)
+        {
+            if (menu == null) return;
+            if (gi < 0 || gi >= _layout.Groups.Count) return;
+
+            FenceBox box = _layout.Groups[gi];
+            FenceTab tab = box.Current;
+            var sub = new ToolStripMenuItem("排序方式");
+
+            AddSortItem(sub, gi, "手动顺序（拖放原序）", BoxSortMode.Manual);
+            sub.DropDownItems.Add(new ToolStripSeparator());
+            AddSortItem(sub, gi, "按名称", BoxSortMode.Name);
+            AddSortItem(sub, gi, "按类型", BoxSortMode.Kind);
+            AddSortItem(sub, gi, "按大小", BoxSortMode.Size);
+            AddSortItem(sub, gi, "按修改时间", BoxSortMode.Modified);
+
+            if (tab.SortMode != BoxSortMode.Manual)
+            {
+                var flip = new ToolStripMenuItem(tab.SortDescending
+                    ? "当前：降序（点击改为升序）"
+                    : "当前：升序（点击改为降序）");
+
+                flip.Click += delegate
+                {
+                    tab.SortDescending = !tab.SortDescending;
+                    MarkDirty();
+                    Render();
+                };
+
+                sub.DropDownItems.Add(new ToolStripSeparator());
+                sub.DropDownItems.Add(flip);
+            }
+
+            menu.Items.Add(sub);
+        }
+
+        private void AddSortItem(ToolStripMenuItem parent, int gi,
+                                 string text, BoxSortMode mode)
+        {
+            if (gi < 0 || gi >= _layout.Groups.Count) return;
+            FenceTab tab = _layout.Groups[gi].Current;
+
+            var item = new ToolStripMenuItem(text);
+            item.Checked = (tab.SortMode == mode);
+            item.Click += delegate { ApplySortMode(gi, mode); };
+            parent.DropDownItems.Add(item);
+        }
+
+        /// <summary>
+        /// 应用排序方式。同一模式再点一次 = 切换升/降序。
+        ///
+        /// 只改分类上的排序标记，不动条目本身 ——
+        /// 「手动顺序」必须能原样回来，否则用户拖放排好的版会被排序毁掉。
+        /// </summary>
+        private void ApplySortMode(int gi, BoxSortMode mode)
+        {
+            if (gi < 0 || gi >= _layout.Groups.Count) return;
+
+            FenceTab tab = _layout.Groups[gi].Current;
+
+            if (tab.SortMode == mode)
+            {
+                if (mode == BoxSortMode.Manual) return;   // 手动顺序无方向可言
+                tab.SortDescending = !tab.SortDescending;
+            }
+            else
+            {
+                tab.SortMode = mode;
+                // 首次选某个方式：大 / 新 排在前面更符合直觉（用户常在找最近改的）
+                tab.SortDescending = (mode == BoxSortMode.Size || mode == BoxSortMode.Modified);
+            }
+
+            MarkDirty();
+            Render();
         }
 
         /// <summary>
