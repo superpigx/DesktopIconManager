@@ -377,6 +377,14 @@ namespace DesktopIconManager.Core
         /// 分类自己设了布局时以分类的为准，见 <see cref="ViewModeOf"/>。</summary>
         public BoxViewMode ViewMode { get; set; }
 
+        /// <summary>
+        /// 是否收起分类标签栏（只留标题栏，内容整体上移）。
+        ///
+        /// 对应参考实现标题栏最右那个「^」按钮：格子组标签太多时收起，
+        /// 一次只看当前分类的内容。面板高度不变，只是省掉标签行那一条。
+        /// </summary>
+        public bool TabBarCollapsed { get; set; }
+
         public List<FenceTab> Tabs { get; private set; }
 
         /// <summary>当前显示的标签页索引。越界会自动收敛到合法范围。</summary>
@@ -677,6 +685,8 @@ namespace DesktopIconManager.Core
                   .Append(Math.Max(0, Math.Min(g.ActiveTab, g.Tabs.Count - 1)))
                   .Append('\t').Append((int)g.ViewMode)
                   .Append('\t').Append(g.Locked ? "1" : "0")
+                  // 第 10 列（可选）：分类标签栏是否收起。缺省视为不收起。
+                  .Append('\t').Append(g.TabBarCollapsed ? "1" : "0")
                   .Append("\r\n");
 
                 foreach (FenceTab tab in g.Tabs)
@@ -791,6 +801,8 @@ namespace DesktopIconManager.Core
                     if (p.Length < 8 || !int.TryParse(p[7], out view)) view = 0;
                     // 第 9 个字段（单盒锁定）可选：缺省不锁
                     bool locked = p.Length >= 9 && p[8] == "1";
+                    // 第 10 个字段（标签栏收起）可选：缺省不收起
+                    bool tabCollapsed = p.Length >= 10 && p[9] == "1";
 
                     box = new FenceBox();
                     box.Tabs.Clear();          // 分类全部由 T 行建立
@@ -798,6 +810,7 @@ namespace DesktopIconManager.Core
                     box.Collapsed = p[5] == "1";
                     box.ActiveTab = active;
                     box.Locked = locked;
+                    box.TabBarCollapsed = tabCollapsed;
                     box.ViewMode = (view == 1) ? BoxViewMode.SmallIcons
                                  : (view == 2) ? BoxViewMode.List
                                  : BoxViewMode.LargeIcons;

@@ -217,7 +217,17 @@ namespace DesktopIconManager.UI
         /// </summary>
         public int HeaderHeight(int tabCount)
         {
-            return _theme.TitleHeight + (tabCount > 1 ? _theme.TabBarHeight : 0);
+            return HeaderHeight(tabCount, false);
+        }
+
+        /// <summary>
+        /// 头部高度，分类标签行可被收起。
+        /// 收起时只剩标题栏 —— 内容区整体上移，面板高度不变。
+        /// </summary>
+        public int HeaderHeight(int tabCount, bool tabBarCollapsed)
+        {
+            bool showTabs = (tabCount > 1) && !tabBarCollapsed;
+            return _theme.TitleHeight + (showTabs ? _theme.TabBarHeight : 0);
         }
 
         /// <summary>标签数量多到无法并排显示时，退化为「当前分类 + n/N」单块。</summary>
@@ -806,104 +816,214 @@ namespace DesktopIconManager.UI
             }
         }
 
+        /// <summary>标题栏右侧按钮的数量。渲染与命中都以此为界，不会漏画或漏点。</summary>
+        public static int TitleButtonCount { get { return 5; } }
+
         /// <summary>
-        /// 标题栏按钮几何（渲染与命中**共用** —— 两处口径一旦不一致，
-        /// 就会出现「画在这、点不动」）。index：0=锁，1=列表切换。
+        /// 标题栏按钮组的几何（渲染与命中**共用** —— 两处口径一旦不一致，
+        /// 就会出现「画在这、点不动」）。
+        ///
+        /// 复刻参考实现的 5 个按钮，**从右往左**编号：
+        ///   0 = 收起 / 展开分类标签栏（^）
+        ///   1 = 列表模式（三横线）
+        ///   2 = 新建分类（+）
+        ///   3 = 锁定（挂锁）
+        ///   4 = 图标模式（田字格）
+        /// 屏幕上从左到右看到的顺序正好相反：田字格 锁 + 三横线 ^
         /// </summary>
         public static Rectangle TitleButtonRect(Rectangle bounds, int titleHeight, int index)
         {
             const int badge = 24;   // 计数徽标占位
-            const int gap = 4;
+            const int gap = 2;
             const int size = 20;
             const int h = 18;
 
-            int y = bounds.Y + Math.Max(0, (titleHeight - h) / 2);
-            int right = bounds.Right - 8 - badge - gap;
+            if (index < 0 || index >= TitleButtonCount) return Rectangle.Empty;
 
-            // 从右往左：徽标 → 锁 → 列表。
-            // 18×16 太小：视觉上分辨不出闭合/开启的锁梁，点也容易点空，
-            // 所以统一放大到 20×18（命中与绘制共用同一矩形，不会漂移）。
-            if (index == 0) return new Rectangle(right - size, y, size, h);
-            return new Rectangle(right - gap - size * 2, y, size, h);
+            int y = bounds.Y + Math.Max(0, (titleHeight - h) / 2);
+            int right = bounds.Right - 8 - badge;
+
+            // index 0 最靠右，往左依次排开
+            return new Rectangle(right - size - index * (size + gap), y, size, h);
         }
 
         /// <summary>
-        /// 画标题栏右侧的两个按钮：锁定（挂锁）与视图循环切换（三横线）。
+        /// 画标题栏右侧的按钮组（复刻参考实现的 5 个按钮）。
         ///
-        /// 视觉原则（v0.9.7 重做）：**克制**。
-        /// 早先锁定态用 0xE8 的主色实心块，绿底 + 深色锁形，在标题栏上像贴了块
-        /// 膏药，越淡的主题越突兀。现在改成「极淡底 + 1px 细描边」：
-        ///   · 锁定：淡强调底（约 12% 不透明度）+ 强调色细框，锁形为强调色
-        ///   · 悬停：中性淡底（约 10%）+ 淡框，只提示「可点」，不抢视线
-        ///   · 常态：无底无框，只有一个安静的线性图标
-        /// 状态主要靠**形状**区分（锁梁闭合 / 抬起），颜色只是辅助 ——
-        /// 这样在任何主题、任何壁纸下都协调，且小尺寸下依然认得出。
+        /// 视觉原则：**克制 + 状态可辨**。
+        ///   · 常态：无底无框，安静的线性图标（不与标题文字抢注意力）
+        ///   · 激活态（图标模式 / 列表模式 / 锁定 / 标签栏已收起）：
+        ///     淡色圆角高亮块 + 细框 —— 参考实现用的就是这种「浅色块」，
+        ///     比整块实色协调，又能一眼看出「当前处于哪个模式」
+        ///   · 锁定态额外换成强调色，形状同时变化（锁梁闭合 / 抬起）
+        ///
+        /// 图形复刻要点：田字格 = 2×2 实心小方块、锁 = 圆角挂锁、
+        /// 加号 = 标准十字、三横线 = 三条等长线、箭头 = 开口 V 形（不是实心三角）。
         /// </summary>
-        /// <param name="hoverButton">鼠标压在哪个按钮上（0=锁，1=视图），-1 表示无。</param>
-        public void DrawTitleButtons(Graphics g, Rectangle bounds, bool locked, int hoverButton)
+        /// <param name="hoverButton">鼠标压在哪个按钮上，-1 表示无。</param>
+        /// <param name="state">当前状态快照（渲染只读状态，不碰模型）。</param>
+        public void DrawTitleButtons(Graphics g, Rectangle bounds, int hoverButton,
+                                     TitleButtonState state)
         {
             if (_disposed || g == null) return;
-            if (bounds.Width < 130) return;   // 太窄放不下，硬画会压到标题文字
+            if (state == null) return;
+
+            // 5 个按钮 + 徽标 + 边距，窄面板放不下就不画（硬画会压到标题文字）
+            if (bounds.Width < 190) return;
 
             g.SmoothingMode = SmoothingMode.AntiAlias;
 
-            for (int i = 0; i < 2; i++)
+            for (int i = 0; i < TitleButtonCount; i++)
             {
                 Rectangle r = TitleButtonRect(bounds, _theme.TitleHeight, i);
                 if (r.IsEmpty) continue;
 
                 bool hot = (i == hoverButton);
-                bool lockOn = (i == 0 && locked);
+                bool on = state.IsActive(i);
+                Rectangle frame = Inflate(r, -1);
 
-                // ---- 底：极淡 tint，绝不做实心块 ----
+                // ---- 高亮块：激活 > 悬停 > 无 ----
                 Color fill;
-                if (lockOn) fill = Color.FromArgb(0x1F, _theme.Accent);   // 约 12%
-                else if (hot) fill = Color.FromArgb(0x1A, _theme.TitleText);
+                if (on) fill = Color.FromArgb(0x42, _theme.TitleText);
+                else if (hot) fill = Color.FromArgb(0x22, _theme.TitleText);
                 else fill = Color.Empty;
 
                 if (fill.A > 0)
                 {
                     using (var brush = new SolidBrush(fill))
                     {
-                        FillRoundedRect(g, brush, Inflate(r, -1), 4);
+                        FillRoundedRect(g, brush, frame, 4);
                     }
                 }
 
-                // ---- 框：1px 细线，锁定用强调色，悬停用中性 ----
                 Color edge;
-                if (lockOn) edge = Color.FromArgb(0x9E, _theme.Accent);
-                else if (hot) edge = Color.FromArgb(0x59, _theme.TitleText);
+                if (on) edge = Color.FromArgb(0x85, _theme.TitleText);
+                else if (hot) edge = Color.FromArgb(0x4D, _theme.TitleText);
                 else edge = Color.Empty;
 
                 if (edge.A > 0)
                 {
                     using (var pen = new Pen(edge, 1f))
                     {
-                        DrawRoundedRect(g, pen, Inflate(r, -1), 4);
+                        DrawRoundedRect(g, pen, frame, 4);
                     }
                 }
 
-                // ---- 图形 ----
+                // ---- 墨色：锁定用强调色；激活/悬停用主文字色；常态压低一档 ----
                 Color ink;
-                if (lockOn) ink = _theme.Accent;                        // 细而清楚，不再是反色块
-                else if (hot) ink = _theme.TitleText;
+                if (i == 3 && state.Locked) ink = _theme.Accent;
+                else if (on || hot) ink = _theme.TitleText;
                 else ink = Color.FromArgb(0xA8, _theme.TitleText);
 
                 using (var pen = new Pen(ink, 1.5f))
                 {
                     pen.StartCap = LineCap.Round;
                     pen.EndCap = LineCap.Round;
+                    DrawTitleGlyph(g, pen, r, i, state);
+                }
+            }
+        }
 
-                    if (i == 0) DrawLockGlyph(g, pen, r, locked);
-                    else
+        /// <summary>画单个按钮的图形。index 与 TitleButtonRect 一致。</summary>
+        private void DrawTitleGlyph(Graphics g, Pen pen, Rectangle r, int index,
+                                   TitleButtonState state)
+        {
+            int cx = r.X + r.Width / 2;
+            int cy = r.Y + r.Height / 2;
+
+            switch (index)
+            {
+                case 0:     // ^ 收起 / 展开分类标签栏（开口 V 形，不用实心三角）
+                {
+                    // 展开态朝上（^ 收起），收起态朝下（v 展开）
+                    int dy = state.TabBarCollapsed ? 1 : -1;
+                    int half = 4;
+                    int tipY = cy + dy * 2;
+                    g.DrawLine(pen, cx - half, tipY - dy * 3, cx, tipY);
+                    g.DrawLine(pen, cx, tipY, cx + half, tipY - dy * 3);
+                    break;
+                }
+
+                case 1:     // 三横线 = 列表模式
+                {
+                    for (int k = 0; k < 3; k++)
                     {
-                        // 视图切换：三条横线（当前模式下加一条主色短线做「进度」暗示）
-                        for (int k = 0; k < 3; k++)
+                        int ly = cy - 4 + k * 4;
+                        g.DrawLine(pen, cx - 5, ly, cx + 5, ly);
+                    }
+                    break;
+                }
+
+                case 2:     // + 新建分类
+                {
+                    g.DrawLine(pen, cx - 4, cy, cx + 4, cy);
+                    g.DrawLine(pen, cx, cy - 4, cx, cy + 4);
+                    break;
+                }
+
+                case 3:     // 挂锁
+                    DrawLockGlyph(g, pen, r, state.Locked);
+                    break;
+
+                default:    // 4 = 田字格 = 图标模式（2×2 实心小方块）
+                {
+                    int s = 3;      // 单格边长
+                    int d = 1;      // 格间距
+                    int total = s * 2 + d;
+                    int x0 = cx - total / 2;
+                    int y0 = cy - total / 2;
+
+                    using (var brush = new SolidBrush(pen.Color))
+                    {
+                        for (int gy = 0; gy < 2; gy++)
                         {
-                            int ly = r.Y + 4 + k * 5;
-                            g.DrawLine(pen, r.X + 5, ly, r.X + r.Width - 5, ly);
+                            for (int gx = 0; gx < 2; gx++)
+                            {
+                                g.FillRectangle(brush,
+                                    x0 + gx * (s + d), y0 + gy * (s + d), s, s);
+                            }
                         }
                     }
+                    break;
+                }
+            }
+        }
+
+        /// <summary>标题栏按钮组的状态快照。</summary>
+        public sealed class TitleButtonState
+        {
+            public bool Locked;
+            /// <summary>当前是否为图标（网格）模式。</summary>
+            public bool IconMode;
+            /// <summary>当前是否为列表模式。</summary>
+            public bool ListMode;
+            /// <summary>是否只有单个分类（此时模式切换意义不大，但仍可用）。</summary>
+            public bool SingleTab;
+            /// <summary>分类标签栏是否已收起。</summary>
+            public bool TabBarCollapsed;
+
+            public TitleButtonState() { }
+
+            public TitleButtonState(bool locked, bool iconMode, bool listMode,
+                                    bool singleTab, bool tabBarCollapsed)
+            {
+                Locked = locked;
+                IconMode = iconMode;
+                ListMode = listMode;
+                SingleTab = singleTab;
+                TabBarCollapsed = tabBarCollapsed;
+            }
+
+            /// <summary>该按钮是否处于「已激活」状态（决定要不要高亮块）。</summary>
+            public bool IsActive(int index)
+            {
+                switch (index)
+                {
+                    case 0: return TabBarCollapsed;
+                    case 1: return ListMode;
+                    case 3: return Locked;
+                    case 4: return IconMode;
+                    default: return false;   // 「+」是动作，不是状态
                 }
             }
         }

@@ -275,13 +275,35 @@ namespace DesktopIconManager.UI
             SaveIfDirty();
         }
 
-        /// <summary>某个标题栏按钮的说明文字（跟随锁定状态实时变化）。</summary>
+        /// <summary>
+        /// 某个标题栏按钮的说明文字。
+        ///
+        /// 措辞对齐参考实现（截图里的气泡）：「切换到列表模式」「锁定」「开锁」
+        /// 「收起分类框」—— 用户已经熟悉这套说法，没必要自己发明。
+        /// </summary>
         private static string TitleTipText(FenceBox box, int button)
         {
-            if (button == 0)
-                return box.Locked ? "已锁定：不能拖动 / 缩放 · 点击解锁"
-                                  : "点击锁定：禁止拖动与缩放";
-            return "切换显示方式：大图标 → 小图标 → 列表";
+            if (box == null) return string.Empty;
+
+            switch (button)
+            {
+                case 0:
+                    return box.TabBarCollapsed ? "展开分类框" : "收起分类框";
+
+                case 1:
+                    return "切换到列表模式";
+
+                case 2:
+                    return "新建分类";
+
+                case 3:
+                    return box.Locked ? "开锁" : "锁定";
+
+                default:
+                    // 图标模式：已在网格时说明当前状态，否则说明点击后切过去
+                    BoxViewMode cur = box.CurrentViewMode;
+                    return cur == BoxViewMode.List ? "切换到图标模式" : "图标模式";
+            }
         }
 
         /// <summary>
@@ -667,7 +689,13 @@ namespace DesktopIconManager.UI
         /// </summary>
         private int HeaderHeightOf(FenceBox box)
         {
-            return _renderer.HeaderHeight(box.Tabs.Count);
+            return _renderer.HeaderHeight(box.Tabs.Count, box.TabBarCollapsed);
+        }
+
+        /// <summary>该盒当前是否显示分类标签行（多分类且未收起）。</summary>
+        private static bool TabBarVisible(FenceBox box)
+        {
+            return box != null && box.Tabs.Count > 1 && !box.TabBarCollapsed;
         }
 
         /// <summary>
@@ -687,6 +715,26 @@ namespace DesktopIconManager.UI
         {
             FenceBox box = _layout.Groups[groupIndex];
             return ItemBoundsAt(groupIndex, itemIndex);
+        }
+
+        /// <summary>
+        /// 打包标题栏按钮组的状态快照。
+        ///
+        /// 渲染只读这个快照，不去访问模型 —— 职责单一，也避免渲染里散落
+        /// 各种判断导致「画的状态」和「实际状态」对不上。
+        /// </summary>
+        private GroupPanelRenderer.TitleButtonState BuildTitleButtonState(FenceBox box)
+        {
+            if (box == null) return new GroupPanelRenderer.TitleButtonState();
+
+            BoxViewMode view = box.CurrentViewMode;
+
+            return new GroupPanelRenderer.TitleButtonState(
+                box.Locked,
+                view != BoxViewMode.List,        // 图标模式
+                view == BoxViewMode.List,        // 列表模式
+                box.Tabs.Count < 2,              // 单分类
+                box.TabBarCollapsed);
         }
 
         /// <summary>收集分类标题，供渲染使用；未组合时返回 null。</summary>
@@ -1907,14 +1955,14 @@ namespace DesktopIconManager.UI
                 _renderer.DrawPanel(g, bounds, box.Title, box.Items.Count,
                                     TabTitlesOf(box), box.ActiveTab, hoverTab, box.Locked);
 
-                // 标题栏按钮（锁 / 视图切换）—— 折叠时也画，标题栏还在。
+                // 标题栏按钮组 —— 面板折叠时也画，标题栏还在。
                 // hoverBtn：悬停的按钮有底衬反馈，「能不能点」不用猜
                 int hoverBtn = (gi == _hoverBtnGroup) ? _hoverBtn : -1;
-                _renderer.DrawTitleButtons(g, bounds, box.Locked, hoverBtn);
+                _renderer.DrawTitleButtons(g, bounds, hoverBtn, BuildTitleButtonState(box));
 
                 // 拖拽排序中：在被拖标签与落点槽位上画反馈
                 if (_drag == DragMode.Tab && _dragMoved && gi == _dragGroup
-                    && !box.Collapsed && box.Tabs.Count > 1)
+                    && !box.Collapsed && TabBarVisible(box))
                 {
                     Rectangle[] rects = _renderer.GetTabRects(bounds, box.Tabs.Count);
                     if (rects != null && rects.Length == box.Tabs.Count)
@@ -2287,8 +2335,9 @@ namespace DesktopIconManager.UI
         }
 
         /// <summary>
-        /// 命中标题栏按钮（0=锁，1=视图切换）。几何与
-        /// GroupPanelRenderer.TitleButtonRect 共用，不可能漂移。
+        /// 命中标题栏按钮。几何与 GroupPanelRenderer.TitleButtonRect 共用，不可能漂移。
+        ///
+        /// 索引：0=收起/展开标签栏，1=列表模式，2=新建分类，3=锁定，4=图标模式。
         /// </summary>
         private bool HitTitleButton(Point p, out int groupIndex, out int button)
         {
@@ -2300,7 +2349,7 @@ namespace DesktopIconManager.UI
                 Rectangle b = ToLocal(_layout.Groups[gi].Bounds);
                 if (!b.Contains(p)) continue;
 
-                for (int i = 0; i < 2; i++)
+                for (int i = 0; i < GroupPanelRenderer.TitleButtonCount; i++)
                 {
                     Rectangle r = GroupPanelRenderer.TitleButtonRect(
                         b, _theme.TitleHeight, i);
@@ -2314,6 +2363,60 @@ namespace DesktopIconManager.UI
                 return false;   // 在这个盒里但没点中按钮
             }
             return false;
+        }
+
+        /// <summary>
+        /// 处理标题栏按钮点击。
+        ///
+        /// 索引与 <see cref="GroupPanelRenderer.TitleButtonRect"/> 一致：
+        ///   0 = 收起 / 展开分类标签栏   1 = 列表模式
+        ///   2 = 新建分类               3 = 锁定 / 开锁
+        ///   4 = 图标（网格）模式
+        /// </summary>
+        private void HandleTitleButton(int gi, int button)
+        {
+            if (gi < 0 || gi >= _layout.Groups.Count) return;
+
+            FenceBox box = _layout.Groups[gi];
+
+            switch (button)
+            {
+                case 0:     // 收起 / 展开分类标签栏
+                {
+                    // 单分类时没有标签栏可收，按钮无意义 —— 直接忽略
+                    if (box.Tabs.Count < 2) return;
+
+                    box.TabBarCollapsed = !box.TabBarCollapsed;
+
+                    // 收起后标签行没了，面板尺寸不必变（内容只是上移）
+                    MarkDirty();
+                    Render();
+                    break;
+                }
+
+                case 1:     // 列表模式
+                    ApplyViewMode(gi, BoxViewMode.List);
+                    break;
+
+                case 2:     // 新建分类
+                    AddTab(gi);
+                    break;
+
+                case 3:     // 锁定 / 开锁
+                    box.Locked = !box.Locked;
+                    MarkDirty();
+                    Render();
+                    break;
+
+                default:    // 4 = 图标（网格）模式
+                    ApplyViewMode(gi, BoxViewMode.LargeIcons);
+                    break;
+            }
+
+            // 气泡正开着时，文字必须立刻跟着新状态变 ——
+            // 「点了没反应」的很大一部分就是这里没刷新
+            if (_tipText != null && _hoverBtnGroup == gi)
+                _tipText = TitleTipText(box, button);
         }
 
         private bool HitResizeGrip(Point p, out int groupIndex)
@@ -2374,7 +2477,7 @@ namespace DesktopIconManager.UI
             for (int gi = _layout.Groups.Count - 1; gi >= 0; gi--)
             {
                 FenceBox box = _layout.Groups[gi];
-                if (box.Tabs.Count < 2) continue;
+                if (!TabBarVisible(box)) continue;   // 收起时不响应标签点击
 
                 Rectangle[] rects = _renderer.GetTabRects(ToLocal(box.Bounds), box.Tabs.Count);
                 if (rects == null) continue;
@@ -2474,32 +2577,11 @@ namespace DesktopIconManager.UI
             _dragGuides.Clear();
             _combineTarget = -1;
 
-            // ---- 标题栏按钮（锁 / 视图切换）：优先级最高，点了就不当拖动处理 ----
+            // ---- 标题栏按钮组：优先级最高，点了就不当拖动处理 ----
             int bgi, bbtn;
             if (HitTitleButton(e.Location, out bgi, out bbtn))
             {
-                FenceBox bb = _layout.Groups[bgi];
-
-                if (bbtn == 0)
-                {
-                    bb.Locked = !bb.Locked;
-
-                    // 气泡正开着时，文字要立刻跟着状态变 ——
-                    // 「点了没反应」的很大一部分就是这里没刷新
-                    if (_tipText != null && _hoverBtnGroup == bgi)
-                        _tipText = TitleTipText(bb, bbtn);
-
-                    MarkDirty();
-                    Render();
-                }
-                else
-                {
-                    // 循环切换：大图标 → 小图标 → 列表 → 大图标。
-                    // 作用在**当前分类**上，格子大小不变（ApplyViewMode 内部已处理）
-                    FenceTab cur = bb.Current;
-                    ApplyViewMode(bgi, (BoxViewMode)(((int)bb.ViewModeOf(cur) + 1) % 3));
-                }
-
+                HandleTitleButton(bgi, bbtn);
                 return;
             }
 
@@ -2676,6 +2758,8 @@ namespace DesktopIconManager.UI
             if (_dragGroup < 0 || _dragGroup >= _layout.Groups.Count) return -1;
 
             FenceBox box = _layout.Groups[_dragGroup];
+            if (!TabBarVisible(box)) return -1;
+
             Rectangle[] rects = _renderer.GetTabRects(ToLocal(box.Bounds), box.Tabs.Count);
             if (rects == null || rects.Length != box.Tabs.Count) return -1;
 

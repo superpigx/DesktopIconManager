@@ -1084,6 +1084,7 @@ namespace DesktopIconManager
                         + "  " + b.Bounds.Width + "×" + b.Bounds.Height
                         + (b.Locked ? "  [锁定]" : "")
                         + (b.Collapsed ? "  [折叠]" : "")
+                        + (b.TabBarCollapsed ? "  [标签栏收起]" : "")
                         + "  布局=" + ViewName(b.ViewMode)
                         + "  当前分类=" + (b.ActiveTab + 1) + "/" + b.Tabs.Count);
 
