@@ -1,4 +1,5 @@
 ﻿using System.Drawing;
+using System.Windows.Forms;
 using DesktopIconManager.Core;
 
 namespace DesktopIconManager.UI
@@ -24,8 +25,40 @@ namespace DesktopIconManager.UI
             if (s.PanelAlpha >= 0)
                 p.PanelFill = WithAlpha(p.PanelFill, s.PanelAlpha);
 
+            // ---- 主题色（设置里的色块）----
+            // 只覆盖强调色与其深色变体，面板底/边框保持主题原样，
+            // 否则整块面板都会被染色，和「只换一个主色」的直觉不符。
+            if (!string.IsNullOrEmpty(s.AccentColor))
+            {
+                try
+                {
+                    Color accent = ColorTranslator.FromHtml(s.AccentColor);
+                    p.Accent = accent;
+                    p.AccentDark = ControlPaint.Dark(accent, 0.18f);
+                }
+                catch
+                {
+                    // 颜色串坏了就用主题原色，不能让整个渲染崩掉
+                }
+            }
+
+            // ---- 桌面字体 ----
+            if (!string.IsNullOrEmpty(s.DesktopFont))
+            {
+                try
+                {
+                    // 只改字号体系，字体名本身由渲染器按 FontFamily 解析
+                    p.FontFamily = s.DesktopFont;
+                }
+                catch { }
+            }
+
+            // ---- 盒子边框 / 圆角（设置里的两个开关）----
+            p.PanelRadius = s.PanelRounded ? s.PanelRadius : 0;
+            if (!s.PanelBorder)
+                p.PanelBorder = WithAlpha(p.PanelBorder, 0);
+
             // ---- 其余外观 ----
-            p.PanelRadius = s.PanelRadius;
             p.ShadowDepth = s.ShadowDepth;
             p.ShadowOffsetY = s.ShadowOffsetY;
             p.DrawShadow = s.ShadowDepth > 0;

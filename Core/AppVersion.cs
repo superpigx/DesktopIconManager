@@ -13,9 +13,9 @@ namespace DesktopIconManager.Core
     {
         public const int Major = 0;
         public const int Minor = 9;
-        public const int Patch = 8;
+        public const int Patch = 9;
 
-        /// <summary>形如 "0.9.8"。</summary>
+        /// <summary>形如 "0.9.9"。</summary>
         public static string Number
         {
             get { return Major + "." + Minor + "." + Patch; }

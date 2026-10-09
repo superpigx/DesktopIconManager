@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Text;
 using System.Windows.Forms;
 using DesktopIconManager.Core;
@@ -30,11 +31,26 @@ namespace DesktopIconManager.UI
         private readonly AppSettings _work;
         private readonly PreviewHandler _preview;
 
-        private readonly TabControl _tabs;
+        /// <summary>左侧导航项与对应内容页的映射。</summary>
+        private readonly ListBox _nav;
+        private readonly Panel _content;
+        private readonly List<TabPage> _pages = new List<TabPage>();
+
         private readonly TabPage _pgLook;
         private readonly TabPage _pgLayout;
         private readonly TabPage _pgBehave;
         private readonly TabPage _pgRules;
+
+        /// <summary>可选主题色（对齐参考实现那一排色块）。</summary>
+        private static readonly string[] Palette =
+        {
+            "#2E7D32", "#1976D2", "#C62828", "#AD1457", "#7B1FA2", "#00838F",
+            "#F9A825", "#EF6C00", "#5D4037", "#455A64", "#00BFA5", "#7CB342",
+            "#D81B60", "#5E35B1", "#00897B", "#F4511E"
+        };
+
+        private RadioButton _fixedRad;
+        private ComboBox _fixedCmb;
 
         private CheckBox _alphaCustom;
         private TrackBar _alpha;
@@ -93,30 +109,63 @@ namespace DesktopIconManager.UI
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
-            ClientSize = new Size(640, 580);
+            ClientSize = new Size(760, 620);
 
-            _tabs = new TabControl();
-            _tabs.Location = new Point(10, 10);
-            _tabs.Size = new Size(620, 512);
+            // ---- 左侧导航（对齐参考实现的「设置中心」）----
+            _nav = new ListBox();
+            _nav.Location = new Point(10, 10);
+            _nav.Size = new Size(132, 542);
+            _nav.BorderStyle = BorderStyle.FixedSingle;
+            _nav.BackColor = _cBg;
+            _nav.ForeColor = _cFg;
+            _nav.Font = new Font("微软雅黑", 9.5f);
+            _nav.Items.AddRange(new object[]
+            {
+                "外观设置", "桌面管理", "常规设置", "整理规则"
+            });
+            Controls.Add(_nav);
+
+            // ---- 右侧内容区 ----
+            _content = new Panel();
+            _content.Location = new Point(150, 10);
+            _content.Size = new Size(596, 542);
+            _content.BackColor = _cBg;
+            _content.AutoScroll = true;
+            Controls.Add(_content);
 
             _pgLook = new TabPage("外观");
             _pgLayout = new TabPage("布局");
             _pgBehave = new TabPage("交互");
-            _pgRules = new TabPage("分类规则");
+            _pgRules = new TabPage("整理规则");
 
             foreach (TabPage p in new[] { _pgLook, _pgLayout, _pgBehave, _pgRules })
             {
-                p.BackColor = _cPage;
+                p.BackColor = _cBg;
                 p.AutoScroll = true;
+                p.Dock = DockStyle.None;
+                p.Location = new Point(0, 0);
+                p.Size = new Size(596, 542);
+                p.Visible = false;
             }
 
-            _tabs.TabPages.AddRange(new[] { _pgLook, _pgLayout, _pgBehave, _pgRules });
-            Controls.Add(_tabs);
+            _pages.AddRange(new[] { _pgLook, _pgLayout, _pgBehave, _pgRules });
+            _content.Controls.AddRange(new Control[] { _pgLook, _pgLayout, _pgBehave, _pgRules });
+
+            _nav.SelectedIndexChanged += delegate
+            {
+                int i = _nav.SelectedIndex;
+                if (i < 0 || i >= _pages.Count) return;
+
+                for (int k = 0; k < _pages.Count; k++)
+                    _pages[k].Visible = (k == i);
+            };
+            _nav.SelectedIndex = 0;
+            _pgLook.Visible = true;
 
             // ---- 底部按钮 ----
             var btnReset = new Button();
             btnReset.Text = "恢复默认";
-            btnReset.Location = new Point(10, 536);
+            btnReset.Location = new Point(10, 566);
             btnReset.Size = new Size(88, 30);
             btnReset.Click += delegate
             {
@@ -132,7 +181,7 @@ namespace DesktopIconManager.UI
 
             var btnPreview = new Button();
             btnPreview.Text = "样式预览";
-            btnPreview.Location = new Point(106, 536);
+            btnPreview.Location = new Point(106, 566);
             btnPreview.Size = new Size(88, 30);
             btnPreview.Click += delegate
             {
@@ -153,14 +202,14 @@ namespace DesktopIconManager.UI
 
             var btnOk = new Button();
             btnOk.Text = "确定";
-            btnOk.Location = new Point(452, 536);
+            btnOk.Location = new Point(572, 566);
             btnOk.Size = new Size(84, 30);
             btnOk.DialogResult = DialogResult.OK;
             Controls.Add(btnOk);
 
             var btnCancel = new Button();
             btnCancel.Text = "取消";
-            btnCancel.Location = new Point(546, 536);
+            btnCancel.Location = new Point(664, 566);
             btnCancel.Size = new Size(84, 30);
             btnCancel.DialogResult = DialogResult.Cancel;
             Controls.Add(btnCancel);
@@ -285,6 +334,247 @@ namespace DesktopIconManager.UI
                 "标签与计数徽标会按此自动略小");
 
             SyncAlphaEnabled();
+
+            // ============================================================
+            //  以下分组对齐参考实现「外观设置」页
+            // ============================================================
+
+            Gap(pg, "颜色");
+
+            var clr = new ListBox();
+            clr.Location = new Point(20, _y);
+            clr.Size = new Size(556, 46);
+            clr.DrawMode = DrawMode.OwnerDrawFixed;
+            clr.ItemHeight = 22;
+            clr.BorderStyle = BorderStyle.FixedSingle;
+            clr.BackColor = _cField;
+            clr.ForeColor = _cFg;
+            clr.Items.AddRange(new object[Palette.Length]);
+            _y += 56;
+
+            int curIdx = PaletteIndexOf(_work.AccentColor);
+            if (curIdx < 0) curIdx = 0;
+            clr.SelectedIndex = curIdx;
+
+            clr.DrawItem += delegate(object s, DrawItemEventArgs e)
+            {
+                e.DrawBackground();
+
+                Color c;
+                try { c = ColorTranslator.FromHtml(Palette[e.Index]); }
+                catch { c = Color.Gray; }
+
+                var box = new Rectangle(e.Bounds.X + 4, e.Bounds.Y + 3, 26, 16);
+                using (var b = new SolidBrush(c)) e.Graphics.FillRectangle(b, box);
+                using (var p = new Pen(_cFgSub)) e.Graphics.DrawRectangle(p, box);
+
+                bool sel = (e.Index == clr.SelectedIndex);
+                using (var b = new SolidBrush(sel ? _cFg : _cFgSub))
+                {
+                    e.Graphics.DrawString(Palette[e.Index], Font, b,
+                        e.Bounds.X + 38, e.Bounds.Y + 3);
+                }
+
+                // 选中打勾 —— 与参考实现一致，光靠高亮底色不够明确
+                if (sel)
+                {
+                    using (var p = new Pen(_cFg, 2f))
+                    {
+                        p.StartCap = LineCap.Round;
+                        p.EndCap = LineCap.Round;
+                        e.Graphics.DrawLines(p, new[]
+                        {
+                            new Point(e.Bounds.X + 544, e.Bounds.Y + 11),
+                            new Point(e.Bounds.X + 548, e.Bounds.Y + 15),
+                            new Point(e.Bounds.X + 556, e.Bounds.Y + 6)
+                        });
+                    }
+                }
+            };
+
+            clr.SelectedIndexChanged += delegate
+            {
+                if (_loading) return;
+                _work.AccentColor = Palette[clr.SelectedIndex];
+                FirePreview();
+            };
+
+            Gap(pg, "桌面字体设置");
+            var fonts = new List<string>();
+            fonts.Add("默认字体");
+            try
+            {
+                foreach (FontFamily fn in FontFamily.Families)
+                    fonts.Add(fn.Name);
+            }
+            catch { }
+
+            Cmb(pg, "字体", fonts.ToArray(), fonts.IndexOf(
+                    string.IsNullOrEmpty(_work.DesktopFont) ? "默认字体" : _work.DesktopFont),
+                delegate (int i)
+                {
+                    _work.DesktopFont = (i <= 0) ? string.Empty : fonts[i];
+                },
+                "选「默认字体」表示跟随主题；改这里会同时作用于标题与图标标签");
+
+            Gap(pg, "背景图片");
+            var bgBox = new TextBox();
+            bgBox.Location = new Point(CtrlX, _y - 1);
+            bgBox.Size = new Size(CtrlW + 210, 22);
+            bgBox.ReadOnly = true;
+            bgBox.BackColor = _cField;
+            bgBox.ForeColor = _cFg;
+            bgBox.Text = _work.BackgroundImage ?? string.Empty;
+            pg.Controls.Add(bgBox);
+
+            var bgBtn = new Button();
+            bgBtn.Text = "选择图片";
+            bgBtn.Location = new Point(CtrlX + CtrlW + 216, _y - 2);
+            bgBtn.Size = new Size(88, 24);
+            bgBtn.Click += delegate
+            {
+                using (var dlg = new OpenFileDialog())
+                {
+                    dlg.Title = "选择桌面背景图";
+                    dlg.Filter = "图片|*.png;*.jpg;*.jpeg;*.bmp|所有文件|*.*";
+                    if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+                    _work.BackgroundImage = dlg.FileName;
+                    bgBox.Text = dlg.FileName;
+                    FirePreview();
+                }
+            };
+            pg.Controls.Add(bgBtn);
+            _y += RowH;
+
+            Gap(pg, "分区标签切换");
+
+            var grpTab = new GroupBox();
+            grpTab.Text = "";
+            grpTab.ForeColor = _cFg;
+            grpTab.BackColor = Color.Transparent;
+            grpTab.Location = new Point(20, _y - 4);
+            grpTab.Size = new Size(560, 34);
+            pg.Controls.Add(grpTab);
+
+            var radClick = new RadioButton();
+            radClick.AutoSize = true;
+            radClick.Text = "点击切换";
+            radClick.ForeColor = _cFg;
+            radClick.BackColor = Color.Transparent;
+            radClick.Location = new Point(16, 6);
+            radClick.Checked = (_work.TabSwitch == TabSwitchMode.Click);
+            radClick.CheckedChanged += delegate
+            {
+                if (_loading) return;
+                if (!radClick.Checked) return;
+                _work.TabSwitch = TabSwitchMode.Click;
+                FirePreview();
+            };
+            grpTab.Controls.Add(radClick);
+
+            var radHover = new RadioButton();
+            radHover.AutoSize = true;
+            radHover.Text = "悬停切换";
+            radHover.ForeColor = _cFg;
+            radHover.BackColor = Color.Transparent;
+            radHover.Location = new Point(140, 6);
+            radHover.Checked = (_work.TabSwitch == TabSwitchMode.Hover);
+            radHover.CheckedChanged += delegate
+            {
+                if (_loading) return;
+                if (!radHover.Checked) return;
+                _work.TabSwitch = TabSwitchMode.Hover;
+                FirePreview();
+            };
+            grpTab.Controls.Add(radHover);
+            _y += 40;
+
+            Gap(pg, "分区菜单标签显示");
+
+            var grpLabel = new GroupBox();
+            grpLabel.Text = "";
+            grpLabel.ForeColor = _cFg;
+            grpLabel.BackColor = Color.Transparent;
+            grpLabel.Location = new Point(20, _y - 4);
+            grpLabel.Size = new Size(560, 34);
+            pg.Controls.Add(grpLabel);
+
+            var radAlways = new RadioButton();
+            radAlways.AutoSize = true;
+            radAlways.Text = "始终显示";
+            radAlways.ForeColor = _cFg;
+            radAlways.BackColor = Color.Transparent;
+            radAlways.Location = new Point(16, 6);
+            radAlways.Checked = _work.TabLabelAlways;
+            radAlways.CheckedChanged += delegate
+            {
+                if (_loading || !radAlways.Checked) return;
+                _work.TabLabelAlways = true;
+                FirePreview();
+            };
+            grpLabel.Controls.Add(radAlways);
+
+            var radOnHover = new RadioButton();
+            radOnHover.AutoSize = true;
+            radOnHover.Text = "悬停显示";
+            radOnHover.ForeColor = _cFg;
+            radOnHover.BackColor = Color.Transparent;
+            radOnHover.Location = new Point(140, 6);
+            radOnHover.Checked = !_work.TabLabelAlways;
+            radOnHover.CheckedChanged += delegate
+            {
+                if (_loading || !radOnHover.Checked) return;
+                _work.TabLabelAlways = false;
+                FirePreview();
+            };
+            grpLabel.Controls.Add(radOnHover);
+            _y += 40;
+
+            Gap(pg, "其他");
+
+            Chk(pg, "盒子显示边框", _work.PanelBorder,
+                delegate (bool v) { _work.PanelBorder = v; });
+
+            Chk(pg, "盒子使用圆角", _work.PanelRounded,
+                delegate (bool v)
+                {
+                    _work.PanelRounded = v;
+                    _work.PanelRadius = v ? Math.Max(6, _work.PanelRadius) : 0;
+                });
+
+            Chk(pg, "在快捷方式图标上显示箭头", _work.ShortcutArrow,
+                delegate (bool v) { _work.ShortcutArrow = v; });
+
+            Chk(pg, "收起后，鼠标移动到标题自动展开", _work.AutoExpandOnHover,
+                delegate (bool v) { _work.AutoExpandOnHover = v; });
+        }
+
+        /// <summary>可用的分区名（= 全部分类名 + 几个常用自定义名）。</summary>
+        private static string[] PartitionNames()
+        {
+            var names = new List<string>();
+            try
+            {
+                var probe = new Classifier(null, null);
+                foreach (CategoryRule r in probe.Rules) names.Add(r.DisplayName);
+            }
+            catch { }
+
+            names.Add("未归类");
+            names.Add("新建分类");
+            return names.ToArray();
+        }
+
+        /// <summary>把 #RRGGBB 找回调色板下标；找不到（跟随主题）返回 -1。</summary>
+        private static int PaletteIndexOf(string html)
+        {
+            if (string.IsNullOrEmpty(html)) return -1;
+
+            for (int i = 0; i < Palette.Length; i++)
+                if (string.Equals(Palette[i], html, StringComparison.OrdinalIgnoreCase))
+                    return i;
+            return -1;
         }
 
         private void BuildLayoutPage()
@@ -368,21 +658,99 @@ namespace DesktopIconManager.UI
         private void BuildRulesPage()
         {
             TabPage pg = _pgRules;
+            _y = 14;
+
+            // ---- 顶部：程序启动时自动整理 ----
+            Chk(pg, "程序启动时自动整理", _work.AutoOrganizeOnStartup,
+                delegate (bool v)
+                {
+                    _work.AutoOrganizeOnStartup = v;
+                    if (_fixedRad != null) _fixedRad.Enabled = v;
+                });
+
+            RadioButton radRules = null;
+            radRules = Rad(pg, "按照【整理规则】，实时整理到各个分区",
+                _work.OrganizeMode == AutoOrganizeMode.ByRules,
+                delegate
+                {
+                    if (_loading || radRules == null || !radRules.Checked) return;
+                    _work.OrganizeMode = AutoOrganizeMode.ByRules;
+                    if (_fixedCmb != null) _fixedCmb.Enabled = false;
+                    FirePreview();
+                });
+
+            // 「整理到固定分区 + 下拉」：截图里这两个控件同行
+            int saveY = _y;
+            _y = saveY - 26;
+
+            var fixedBox = new Panel();
+            fixedBox.Location = new Point(20, _y);
+            fixedBox.Size = new Size(566, 26);
+            fixedBox.BackColor = Color.Transparent;
+            pg.Controls.Add(fixedBox);
+
+            var radFixed = new RadioButton();
+            radFixed.AutoSize = true;
+            radFixed.Text = "整理到固定分区";
+            radFixed.ForeColor = _cFg;
+            radFixed.BackColor = Color.Transparent;
+            radFixed.Location = new Point(0, 4);
+            radFixed.Checked = (_work.OrganizeMode == AutoOrganizeMode.FixedPartition);
+            radFixed.Enabled = _work.AutoOrganizeOnStartup;
+            radFixed.CheckedChanged += delegate
+            {
+                if (_loading || !radFixed.Checked) return;
+                _work.OrganizeMode = AutoOrganizeMode.FixedPartition;
+                if (_fixedCmb != null) _fixedCmb.Enabled = true;
+                FirePreview();
+            };
+            fixedBox.Controls.Add(radFixed);
+            _fixedRad = radFixed;
+
+            var cmbFixed = new ComboBox();
+            cmbFixed.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbFixed.Location = new Point(110, 2);
+            cmbFixed.Size = new Size(180, 22);
+            cmbFixed.ForeColor = _cFg;
+            cmbFixed.BackColor = _cField;
+            string[] parts = PartitionNames();
+            cmbFixed.Items.AddRange(parts);
+            int fi = Array.IndexOf(parts, _work.FixedPartition ?? string.Empty);
+            cmbFixed.SelectedIndex = fi >= 0 ? fi : 0;
+            cmbFixed.Enabled = (_work.OrganizeMode == AutoOrganizeMode.FixedPartition);
+            cmbFixed.SelectedIndexChanged += delegate
+            {
+                if (_loading) return;
+                _work.FixedPartition = cmbFixed.SelectedItem as string;
+                FirePreview();
+            };
+            fixedBox.Controls.Add(cmbFixed);
+            _fixedCmb = cmbFixed;
+
+            _y = saveY;
+            Gap(pg, "整理规则");
 
             // ---- 规则表格（仿原版「整理规则」：类型 / 后缀 / 启用开关）----
             // 勾选 = 启用；取消勾选后该类文件落「未归类」
             var grid = new ListView();
-            grid.Location = new Point(14, 34);
-            grid.Size = new Size(588, 118);
+            grid.Location = new Point(14, _y);
+            grid.Size = new Size(568, 190);
             grid.View = View.Details;
             grid.FullRowSelect = true;
             grid.HeaderStyle = ColumnHeaderStyle.Nonclickable;
             grid.CheckBoxes = true;
             grid.HideSelection = true;
-            grid.Columns.Add("分类", 120);
-            grid.Columns.Add("后缀数", 66, HorizontalAlignment.Right);
-            grid.Columns.Add("包含后缀", 370);
+            grid.BackColor = _cField;
+            grid.ForeColor = _cFg;
+            grid.BorderStyle = BorderStyle.FixedSingle;
+
+            // 列顺序对齐参考实现：类型 / 包含后缀 / 选择桌面分区 /（勾选=启用）
+            grid.Columns.Add("类型", 88);
+            grid.Columns.Add("包含后缀", 268);
+            grid.Columns.Add("选择桌面分区", 120);
             pg.Controls.Add(grid);
+
+            _y += 198;
 
             var probe = new Classifier(_work.ExtraRuleText, null);
             foreach (CategoryRule r in probe.Rules)
@@ -392,13 +760,75 @@ namespace DesktopIconManager.UI
 
                 // 先设状态再入列 —— 入列后 ItemChecked 才会因用户点击触发
                 var it = new ListViewItem(r.DisplayName);
-                it.SubItems.Add(exts.Count.ToString());
-                it.SubItems.Add(string.Join(" ", exts.ToArray()));
+
+                // 后缀列只展示前若干个 —— 全列出来会把行撑得没法看
+                string all = string.Join(" ", exts.ToArray());
+                it.SubItems.Add(all.Length > 46 ? all.Substring(0, 45) + "…" : all);
+                it.SubItems.Add(_work.GetPartitionOf(r.DisplayName) ?? r.DisplayName);
                 it.Checked = _work.DisabledCategories == null
                     || !_work.DisabledCategories.Contains(r.DisplayName);
                 it.Tag = r.DisplayName;
                 grid.Items.Add(it);
             }
+
+            // 「选择桌面分区」列：双击（或点击）弹出下拉，改完立刻生效
+            grid.MouseUp += delegate(object s, MouseEventArgs e)
+            {
+                if (e.Button != MouseButtons.Left) return;
+
+                ListViewItem item = grid.GetItemAt(e.X, e.Y);
+                if (item == null) return;
+
+                // 第 3 列（索引 2）才是分区列
+                int col = -1;
+                for (int i = 0; i < item.SubItems.Count; i++)
+                {
+                    if (e.X >= item.SubItems[i].Bounds.Left &&
+                        e.X < item.SubItems[i].Bounds.Right)
+                    {
+                        col = i;
+                        break;
+                    }
+                }
+                if (col != 2) return;
+
+                string category = item.Tag as string;
+                if (string.IsNullOrEmpty(category)) return;
+
+                var menu = new ContextMenuStrip();
+                foreach (string pn in PartitionNames())
+                {
+                    string captured = pn;
+                    var mi = new ToolStripMenuItem(pn);
+                    mi.Checked = (string.Equals(
+                        _work.GetPartitionOf(category) ?? category, pn,
+                        StringComparison.OrdinalIgnoreCase));
+                    mi.Click += delegate
+                    {
+                        _work.EnsurePartitionMap();
+
+                        // 覆盖同分类的旧映射
+                        for (int i = _work.PartitionMap.Count - 1; i >= 0; i--)
+                        {
+                            string line = _work.PartitionMap[i];
+                            if (string.IsNullOrEmpty(line)) continue;
+
+                            int eq = line.IndexOf('=');
+                            if (eq <= 0) continue;
+
+                            if (string.Equals(line.Substring(0, eq).Trim(), category,
+                                              StringComparison.OrdinalIgnoreCase))
+                                _work.PartitionMap.RemoveAt(i);
+                        }
+
+                        _work.PartitionMap.Add(category + "=" + captured);
+                        item.SubItems[2].Text = captured;
+                        FirePreview();
+                    };
+                    menu.Items.Add(mi);
+                }
+                menu.Show(grid, new Point(e.X, e.Y + 1));
+            };
 
             grid.ItemChecked += delegate(object s, ItemCheckedEventArgs e)
             {
@@ -420,8 +850,8 @@ namespace DesktopIconManager.UI
 
             var tip = new Label();
             tip.AutoSize = false;
-            tip.Location = new Point(14, 162);
-            tip.Size = new Size(590, 34);
+            tip.Location = new Point(14, _y + 4);
+            tip.Size = new Size(568, 34);
             tip.ForeColor = _cFgHint;
             tip.Text = "内置规则不可删（避免误操作把基础分类搞坏），但可以往下追加扩展名。\r\n"
                      + "每行一条，格式：分类名=.扩展名,.扩展名（也可以只写 md 不带点）";
@@ -430,8 +860,10 @@ namespace DesktopIconManager.UI
             _extraBox = new TextBox();
             _extraBox.Multiline = true;
             _extraBox.ScrollBars = ScrollBars.Vertical;
-            _extraBox.Location = new Point(14, 202);
-            _extraBox.Size = new Size(588, 110);
+            _extraBox.Location = new Point(14, _y + 42);
+            _extraBox.Size = new Size(568, 110);
+            _extraBox.BackColor = _cField;
+            _extraBox.ForeColor = _cFg;
             _extraBox.Font = new Font("Consolas", 9f);
             _extraBox.Text = ToCrlf(_work.ExtraRuleText);
             _extraBox.TextChanged += delegate
@@ -444,7 +876,7 @@ namespace DesktopIconManager.UI
 
             var lbl = new Label();
             lbl.AutoSize = true;
-            lbl.Location = new Point(14, 324);
+            lbl.Location = new Point(14, _y + 164);
             lbl.ForeColor = _cFg;
             lbl.Text = "当前生效的完整规则（已禁用的分类会标注）：";
             pg.Controls.Add(lbl);
@@ -454,8 +886,8 @@ namespace DesktopIconManager.UI
             _ruleView.ReadOnly = true;
             _ruleView.ScrollBars = ScrollBars.Vertical;
             _ruleView.BackColor = _cField;
-            _ruleView.Location = new Point(14, 346);
-            _ruleView.Size = new Size(588, 126);
+            _ruleView.Location = new Point(14, _y + 186);
+            _ruleView.Size = new Size(568, 126);
             _ruleView.Font = new Font("Consolas", 8.5f);
             pg.Controls.Add(_ruleView);
 
@@ -577,6 +1009,27 @@ namespace DesktopIconManager.UI
             _y += RowH;
             if (hint != null) Hint(pg, hint);
             return c;
+        }
+
+        /// <summary>
+        /// 一行单选圆点（截图里的 ◉ / ○ 那种）。
+        /// 用 RadioButton 控件而不是自绘，才能吃到系统的键盘操作与焦点行为。
+        /// </summary>
+        private RadioButton Rad(TabPage pg, string text, bool value, Action onClick)
+        {
+            var r = new RadioButton();
+            r.AutoSize = true;
+            r.Text = text;
+            r.Checked = value;
+            r.ForeColor = _cFg;
+            r.BackColor = Color.Transparent;
+            r.Location = new Point(20, _y);
+
+            if (onClick != null) r.CheckedChanged += delegate { onClick(); };
+
+            pg.Controls.Add(r);
+            _y += 26;
+            return r;
         }
 
         private CheckBox Chk(TabPage pg, string label, bool value,

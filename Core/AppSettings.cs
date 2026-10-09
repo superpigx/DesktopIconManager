@@ -25,6 +25,26 @@ namespace DesktopIconManager.Core
     ///
     /// 解析对缺失/损坏的条目一律回退到默认值，绝不因为一行坏数据让程序起不来。
     /// </summary>
+    /// <summary>
+    /// 启动时的自动整理方式（对应设置里「程序启动时自动整理」下面的两个单选）。
+    /// </summary>
+    public enum AutoOrganizeMode
+    {
+        /// <summary>按整理规则，把文件实时归到各个同名分区。</summary>
+        ByRules = 0,
+        /// <summary>不管规则，所有文件都丢到同一个固定分区。</summary>
+        FixedPartition = 1
+    }
+
+    /// <summary>分区标签的切换方式。</summary>
+    public enum TabSwitchMode
+    {
+        /// <summary>点击标签切换（默认，误触少）。</summary>
+        Click = 0,
+        /// <summary>鼠标悬停即切换。</summary>
+        Hover = 1
+    }
+
     public sealed class AppSettings
     {
         private const string Marker = "# DIM-SETTINGS v1";
@@ -105,6 +125,83 @@ namespace DesktopIconManager.Core
 
         /// <summary>开机自动启动覆盖层（写 HKCU Run，不需要管理员权限）。</summary>
         public bool AutoStart { get; set; }
+
+        // ---- 自动整理（设置「整理规则」页顶部）----
+
+        /// <summary>程序启动时自动整理桌面图标。</summary>
+        public bool AutoOrganizeOnStartup { get; set; }
+
+        /// <summary>自动整理的方式：按规则 / 全部丢到固定分区。</summary>
+        public AutoOrganizeMode OrganizeMode { get; set; }
+
+        /// <summary>「整理到固定分区」模式下的目标分区名。</summary>
+        public string FixedPartition { get; set; }
+
+        /// <summary>
+        /// 分类 → 分区的映射（表格「选择桌面分区」列）。
+        ///
+        /// 每项形如 <c>文档=我的文档</c>；没有映射的分类归到同名分区。
+        /// 存成 List 是为了在设置表格里逐行编辑。
+        /// </summary>
+        public List<string> PartitionMap { get; private set; }
+
+        /// <summary>确保分区映射表已初始化（设置界面写入前调用）。</summary>
+        public void EnsurePartitionMap()
+        {
+            if (PartitionMap == null) PartitionMap = new List<string>();
+        }
+
+        /// <summary>取某分类的映射分区；没有映射时返回 null（表示同名分区）。</summary>
+        public string GetPartitionOf(string category)
+        {
+            if (PartitionMap == null || string.IsNullOrEmpty(category)) return null;
+
+            for (int i = 0; i < PartitionMap.Count; i++)
+            {
+                string line = PartitionMap[i];
+                if (string.IsNullOrEmpty(line)) continue;
+
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+
+                if (string.Equals(line.Substring(0, eq).Trim(), category,
+                                  StringComparison.OrdinalIgnoreCase))
+                {
+                    string v = line.Substring(eq + 1).Trim();
+                    return v.Length == 0 ? null : v;
+                }
+            }
+            return null;
+        }
+
+        // ---- 外观补充（设置「外观设置」页）----
+
+        /// <summary>主题色（强调色），格式 <c>#RRGGBB</c>；空 = 跟随主题。</summary>
+        public string AccentColor { get; set; }
+
+        /// <summary>面板背景图路径；空 = 不使用。</summary>
+        public string BackgroundImage { get; set; }
+
+        /// <summary>桌面字体名；空 / "默认字体" = 跟随主题。</summary>
+        public string DesktopFont { get; set; }
+
+        /// <summary>分区标签切换方式：点击 / 悬停。</summary>
+        public TabSwitchMode TabSwitch { get; set; }
+
+        /// <summary>分区标签始终显示（否则仅悬停显示）。</summary>
+        public bool TabLabelAlways { get; set; }
+
+        /// <summary>盒子显示边框。</summary>
+        public bool PanelBorder { get; set; }
+
+        /// <summary>盒子使用圆角。</summary>
+        public bool PanelRounded { get; set; }
+
+        /// <summary>在快捷方式图标上显示箭头标记。</summary>
+        public bool ShortcutArrow { get; set; }
+
+        /// <summary>标签栏收起后，鼠标移到标题上自动展开。</summary>
+        public bool AutoExpandOnHover { get; set; }
 
         // ---- 性能与高级（复盘 v0.9.2 新增）----
         /// <summary>
@@ -188,6 +285,23 @@ namespace DesktopIconManager.Core
             DisabledCategories = new List<string>();
             AutoStart = false;
 
+            // 自动整理
+            AutoOrganizeOnStartup = true;
+            OrganizeMode = AutoOrganizeMode.ByRules;
+            FixedPartition = "其它";
+            PartitionMap = new List<string>();
+
+            // 外观补充
+            AccentColor = string.Empty;
+            BackgroundImage = string.Empty;
+            DesktopFont = string.Empty;
+            TabSwitch = TabSwitchMode.Click;
+            TabLabelAlways = true;
+            PanelBorder = true;
+            PanelRounded = true;
+            ShortcutArrow = false;
+            AutoExpandOnHover = true;
+
             // 性能与高级
             UseFolderView = false;
             PerfDirtyRect = true;
@@ -212,6 +326,26 @@ namespace DesktopIconManager.Core
             if (o == null) return;
 
             Theme = o.Theme;
+
+            // 自动整理
+            AutoOrganizeOnStartup = o.AutoOrganizeOnStartup;
+            OrganizeMode = o.OrganizeMode;
+            FixedPartition = o.FixedPartition;
+            EnsurePartitionMap();
+            PartitionMap.Clear();
+            if (o.PartitionMap != null) PartitionMap.AddRange(o.PartitionMap);
+
+            // 外观补充
+            AccentColor = o.AccentColor;
+            BackgroundImage = o.BackgroundImage;
+            DesktopFont = o.DesktopFont;
+            TabSwitch = o.TabSwitch;
+            TabLabelAlways = o.TabLabelAlways;
+            PanelBorder = o.PanelBorder;
+            PanelRounded = o.PanelRounded;
+            ShortcutArrow = o.ShortcutArrow;
+            AutoExpandOnHover = o.AutoExpandOnHover;
+
             PanelAlpha = o.PanelAlpha;
             PanelRadius = o.PanelRadius;
             ShadowDepth = o.ShadowDepth;
@@ -324,6 +458,36 @@ namespace DesktopIconManager.Core
 
             s.Theme = GetStr(map, "theme", s.Theme);
 
+            // 自动整理
+            s.AutoOrganizeOnStartup = GetBool(map, "autoOrganize", s.AutoOrganizeOnStartup);
+            s.OrganizeMode = (AutoOrganizeMode)Clamp(
+                GetInt(map, "organizeMode", (int)s.OrganizeMode), 0, 1);
+            s.FixedPartition = GetStr(map, "fixedPartition", s.FixedPartition);
+
+            s.EnsurePartitionMap();
+            string pm = GetStr(map, "partitionMap", null);
+            if (!string.IsNullOrEmpty(pm))
+            {
+                s.PartitionMap.Clear();
+                foreach (string one in pm.Split(';'))
+                {
+                    string t2 = Unescape(one).Trim();
+                    if (t2.Length > 0) s.PartitionMap.Add(t2);
+                }
+            }
+
+            // 外观补充
+            s.AccentColor = GetStr(map, "accentColor", s.AccentColor);
+            s.BackgroundImage = GetStr(map, "backgroundImage", s.BackgroundImage);
+            s.DesktopFont = GetStr(map, "desktopFont", s.DesktopFont);
+            s.TabSwitch = (TabSwitchMode)Clamp(
+                GetInt(map, "tabSwitch", (int)s.TabSwitch), 0, 1);
+            s.TabLabelAlways = GetBool(map, "tabLabelAlways", s.TabLabelAlways);
+            s.PanelBorder = GetBool(map, "panelBorder", s.PanelBorder);
+            s.PanelRounded = GetBool(map, "panelRounded", s.PanelRounded);
+            s.ShortcutArrow = GetBool(map, "shortcutArrow", s.ShortcutArrow);
+            s.AutoExpandOnHover = GetBool(map, "autoExpandOnHover", s.AutoExpandOnHover);
+
             s.PanelAlpha = Clamp(GetInt(map, "panelAlpha", s.PanelAlpha), -1, 255);
             s.PanelRadius = Clamp(GetInt(map, "panelRadius", s.PanelRadius), 0, 24);
             s.ShadowDepth = Clamp(GetInt(map, "shadowDepth", s.ShadowDepth), 0, 24);
@@ -413,6 +577,24 @@ namespace DesktopIconManager.Core
             if (DisabledCategories != null && DisabledCategories.Count > 0)
                 sb.AppendLine("disabledCategories=" + string.Join(",", DisabledCategories.ToArray()));
             sb.AppendLine("autoStart=" + (AutoStart ? "1" : "0"));
+
+            sb.AppendLine("# ---- 自动整理 ----");
+            sb.AppendLine("autoOrganize=" + (AutoOrganizeOnStartup ? "1" : "0"));
+            sb.AppendLine("organizeMode=" + (int)OrganizeMode);
+            sb.AppendLine("fixedPartition=" + Escape(FixedPartition ?? string.Empty));
+            if (PartitionMap != null && PartitionMap.Count > 0)
+                sb.AppendLine("partitionMap=" + Escape(string.Join(";", PartitionMap.ToArray())));
+
+            sb.AppendLine("# ---- 外观补充 ----");
+            sb.AppendLine("accentColor=" + Escape(AccentColor ?? string.Empty));
+            sb.AppendLine("backgroundImage=" + Escape(BackgroundImage ?? string.Empty));
+            sb.AppendLine("desktopFont=" + Escape(DesktopFont ?? string.Empty));
+            sb.AppendLine("tabSwitch=" + (int)TabSwitch);
+            sb.AppendLine("tabLabelAlways=" + (TabLabelAlways ? "1" : "0"));
+            sb.AppendLine("panelBorder=" + (PanelBorder ? "1" : "0"));
+            sb.AppendLine("panelRounded=" + (PanelRounded ? "1" : "0"));
+            sb.AppendLine("shortcutArrow=" + (ShortcutArrow ? "1" : "0"));
+            sb.AppendLine("autoExpandOnHover=" + (AutoExpandOnHover ? "1" : "0"));
 
             sb.AppendLine("# ---- 性能与高级（改完重启覆盖层生效）----");
             sb.AppendLine("useFolderView=" + (UseFolderView ? "1" : "0"));
