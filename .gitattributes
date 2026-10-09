@@ -1,0 +1,14 @@
+# ============================================================
+#  换行符策略（Windows 专用项目）
+# ============================================================
+#  bat 是 cmd 逐行解析的：**必须**是 CRLF。
+#  LF-only 的 bat 会被 cmd 错位解析 —— 表现为「echo 变成 cho」、
+#  「set /p 变成 '/'p」、「A」被当成命令等一堆莫名其妙的报错。
+#  这里显式钉死，避免任何机器上的 autocrlf 设置把它再变成 LF。
+*.bat text eol=crlf
+
+# C# 源码与文档统一 CRLF（.NET Framework / csc / VS 均为 Windows 习惯）
+*.cs   text eol=crlf
+*.csproj text eol=crlf
+*.md   text eol=crlf
+*.txt  text eol=crlf
