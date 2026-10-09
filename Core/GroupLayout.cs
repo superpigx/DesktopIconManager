@@ -90,6 +90,20 @@ namespace DesktopIconManager.Core
         /// </summary>
         public TabOrigin Origin { get; set; }
 
+        /// <summary>
+        /// **该分类自己的**显示方式；null = 跟随所在收纳盒。
+        ///
+        /// 为什么要有这一层：组合成格子组后几个分类同处一个盒子，
+        /// 但显示方式必须**逐分类独立** —— 「文件夹」用大图标网格，
+        /// 「快捷方式」用列表，同屏并存互不干扰。
+        /// 挂在盒上的话，一点切换就整盒跟着变，组合出来的独立性立刻失效。
+        ///
+        /// 用可空类型而不是再加一个 bool 开关：
+        /// 「未设置（跟盒）」与「设置为某个值」两种状态天然可区分，
+        /// 存档里不写这一列就等于 null，老存档天然兼容。
+        /// </summary>
+        public BoxViewMode? ViewMode { get; set; }
+
         public FenceTab()
         {
             Title = "新分类";
@@ -144,7 +158,8 @@ namespace DesktopIconManager.Core
         /// </summary>
         public bool Locked { get; set; }
 
-        /// <summary>显示布局（大图标 / 小图标 / 列表），逐盒独立。</summary>
+        /// <summary>显示布局（大图标 / 小图标 / 列表），逐盒独立。
+        /// 分类自己设了布局时以分类的为准，见 <see cref="ViewModeOf"/>。</summary>
         public BoxViewMode ViewMode { get; set; }
 
         public List<FenceTab> Tabs { get; private set; }
@@ -211,7 +226,13 @@ namespace DesktopIconManager.Core
             box.Tabs.Clear();
             box.Tabs.Add(tab);
             box.Bounds = tab.Origin.Bounds;
-            box.ViewMode = tab.Origin.ViewMode;
+
+            // 显示方式优先级：本分类自己设的 > 合并前的盒设置 > 大图标默认值。
+            // 拆出来之后它就是独立的盒了，分类级设置必须交还给盒级，
+            // 同时清掉分类级标记，避免下次再组合时拿这份值覆盖它真正的新位置。
+            box.ViewMode = tab.ViewMode.HasValue ? tab.ViewMode.Value : tab.Origin.ViewMode;
+            tab.ViewMode = null;
+
             box.Locked = tab.Origin.Locked;
             box.Collapsed = tab.Origin.Collapsed;
             box.ActiveTab = 0;
@@ -315,6 +336,24 @@ namespace DesktopIconManager.Core
                 if (ActiveTab >= Tabs.Count) ActiveTab = Tabs.Count - 1;
                 return Tabs[ActiveTab];
             }
+        }
+
+        /// <summary>
+        /// 某个分类的有效显示方式：**它自己设了就用它的，没设就跟盒**。
+        ///
+        /// 渲染、命中测试、容量计算、尺寸收紧全部必须走这里 ——
+        /// 混用「盒的 ViewMode」和「分类的 ViewMode」就是「组合后显示方式被统一」的根源。
+        /// </summary>
+        public BoxViewMode ViewModeOf(FenceTab tab)
+        {
+            if (tab != null && tab.ViewMode.HasValue) return tab.ViewMode.Value;
+            return ViewMode;
+        }
+
+        /// <summary>当前分类的有效显示方式。</summary>
+        public BoxViewMode CurrentViewMode
+        {
+            get { return ViewModeOf(Current); }
         }
 
         /// <summary>当前分类的标题。等价于原程序的「分类名」。</summary>
@@ -443,6 +482,12 @@ namespace DesktopIconManager.Core
                           .Append('\t').Append(o.Collapsed ? "1" : "0");
                     }
 
+                    // 再往后：分类自己的显示方式（第 10 列）。
+                    // 同样是可选的 —— 没单独设置过就不写这一列，行长度保持不变，
+                    // 老 exe 照常能读（它会忽略多出来的字段）。
+                    if (tab.ViewMode.HasValue)
+                        sb.Append('\t').Append((int)tab.ViewMode.Value);
+
                     sb.Append("\r\n");
 
                     foreach (GroupItem it in tab.Items)
@@ -559,7 +604,7 @@ namespace DesktopIconManager.Core
                             int.TryParse(p[5], out oh))
                         {
                             // 字段序号（从 0 起）：
-                            //   0=T  1=标题  2..5=边界  6=布局  7=锁定  8=折叠
+                            //   0=T  1=标题  2..5=边界  6=布局  7=锁定  8=折叠  9=本分类布局
                             // 判定一律用「该位是否存在」= index + 1。
                             // 写成 >=10 / >=11 这类偏大的值会让后两位永远读不到 ——
                             // 表现是「拆回去后锁定/折叠状态丢了」，很难查。
@@ -575,6 +620,21 @@ namespace DesktopIconManager.Core
 
                             var o = new TabOrigin(new Rectangle(ox, oy, ow, oh), vm, oLock, oCol);
                             if (o.IsUsable) tab.Origin = o;
+                        }
+                    }
+
+                    // 第 10 列（可选）：本分类自己的显示方式。
+                    // 与来源记录**分开判** —— 来源段可能因为边界不合法被整体丢弃，
+                    // 但显示方式仍要认下来，否则用户设过的布局会悄悄丢失。
+                    // 只有出现这一位才读；缺省 = 跟随所在盒。
+                    if (p.Length >= 10)
+                    {
+                        int tv;
+                        if (int.TryParse(p[9], out tv))
+                        {
+                            tab.ViewMode = (tv == 1) ? BoxViewMode.SmallIcons
+                                         : (tv == 2) ? BoxViewMode.List
+                                         : BoxViewMode.LargeIcons;
                         }
                     }
 

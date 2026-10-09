@@ -674,8 +674,11 @@ namespace DesktopIconManager.UI
         private Rectangle ItemBoundsOf(int groupIndex, int itemIndex)
         {
             FenceBox box = _layout.Groups[groupIndex];
+            // 用分类自己的有效显示方式（没单独设置就跟盒）——
+            // 组合成格子组后各分类布局独立，全靠这一处
             return _renderer.GetItemBounds(
-                ToLocal(box.Bounds), HeaderHeightOf(box), box.ViewMode, itemIndex);
+                ToLocal(box.Bounds), HeaderHeightOf(box),
+                box.CurrentViewMode, itemIndex);
         }
 
         /// <summary>收集分类标题，供渲染使用；未组合时返回 null。</summary>
@@ -713,11 +716,14 @@ namespace DesktopIconManager.UI
 
             FenceBox box = _layout.Groups[groupIndex];
             int count = Math.Max(1, box.Items.Count);
-            Size cell = _renderer.CellSize(box.ViewMode);
+
+            // 尺寸只按**当前分类**的显示方式算：格子显示的是它，不是整盒
+            BoxViewMode view = box.CurrentViewMode;
+            Size cell = _renderer.CellSize(view);
 
             int w, h;
 
-            if (box.ViewMode == BoxViewMode.List)
+            if (view == BoxViewMode.List)
             {
                 // 列表模式：宽度由用户拖拽决定（只保一个最小可读宽度），仅收紧高度
                 w = Math.Max(_theme.ItemWidth * 3, box.Bounds.Width);
@@ -966,6 +972,17 @@ namespace DesktopIconManager.UI
                 FenceTab match = FindTab(dst, st.Title);
                 if (match != null) toMerge.Add(new KeyValuePair<FenceTab, FenceTab>(st, match));
                 else toMove.Add(st);
+            }
+
+            // 搬迁前把「跟随源盒」的显示方式固化到分类自己身上。
+            //
+            // 不固化的话：源盒是列表视图，搬进目标是网格视图的盒子后，
+            // 这个分类会**静默变成网格** —— 组合本该保持各分类原样，
+            // 用户看到的是「一合并就变了」。
+            foreach (FenceTab st in src.Tabs)
+            {
+                if (!st.ViewMode.HasValue)
+                    st.ViewMode = src.ViewModeOf(st);
             }
 
             // 1. 同名分类：条目并入，重复跳过
@@ -1228,14 +1245,19 @@ namespace DesktopIconManager.UI
                 int maxCols = AppSettings.Current.MaxColumns;
                 if (maxCols < 1) maxCols = 5;
 
+                // 显示方式取该分类自己的有效值（没单独设置就跟盒），
+                // 不能直接用 box.ViewMode —— 组合后各分类布局本就可能不同
+                BoxViewMode tabView = box.ViewModeOf(tab);
+
                 Size sz = _renderer.MeasurePanelSize(
                     Math.Max(1, tab.Items.Count), maxCols,
-                    _renderer.HeaderHeight(1), box.ViewMode);
+                    _renderer.HeaderHeight(1), tabView);
 
                 nb = new FenceBox();
                 nb.Tabs.Clear();
                 nb.Tabs.Add(tab);
-                nb.ViewMode = box.ViewMode;     // 布局/锁定跟随源盒，别退回默认值
+                nb.ViewMode = tabView;         // 交还盒级，别退回默认值
+                tab.ViewMode = null;            // 单分类的独立盒不需要分类级标记
                 nb.Locked = box.Locked;
                 nb.ActiveTab = 0;
                 nb.Bounds = FindFreeSlot(box.Bounds, sz);
@@ -1431,8 +1453,7 @@ namespace DesktopIconManager.UI
             var tabs = new List<FenceTab>(src.Tabs);
             int baseX = src.Bounds.X;
             int baseY = src.Bounds.Y;
-            BoxViewMode view = src.ViewMode;
-            bool locked = src.Locked;
+            bool locked = src.Locked;   // 显示方式逐分类取，见下方 tabView
 
             int maxCols = AppSettings.Current.MaxColumns;
             if (maxCols < 1) maxCols = 5;
@@ -1460,8 +1481,11 @@ namespace DesktopIconManager.UI
                 else
                 {
                     // ② 无记录 → 老行为：测量尺寸后从原盒位置起流式排布
+                    // 每个分类各自的显示方式（组合成格子组时它们可能不一致）
+                    BoxViewMode tabView = src.ViewModeOf(tab);
+
                     Size sz = _renderer.MeasurePanelSize(
-                        Math.Max(1, tab.Items.Count), maxCols, singleHeader, view);
+                        Math.Max(1, tab.Items.Count), maxCols, singleHeader, tabView);
 
                     if (x + sz.Width > screen.Right - 8 && x > baseX)
                     {
@@ -1473,7 +1497,8 @@ namespace DesktopIconManager.UI
                     nb = new FenceBox();
                     nb.Tabs.Clear();
                     nb.Tabs.Add(tab);
-                    nb.ViewMode = view;
+                    nb.ViewMode = tabView;
+                    tab.ViewMode = null;
                     nb.Locked = locked;
                     nb.ActiveTab = 0;
                     nb.Bounds = new Rectangle(x, y, sz.Width, sz.Height);
@@ -1526,13 +1551,13 @@ namespace DesktopIconManager.UI
             int headerH = HeaderHeightOf(box);
 
             int columns, rows;
-            _renderer.MeasureCapacity(b, headerH, box.ViewMode, out columns, out rows);
+            _renderer.MeasureCapacity(b, headerH, box.CurrentViewMode, out columns, out rows);
 
             int need = box.Items.Count;
             if (need <= columns * rows) return;
 
             int needRows = (need + columns - 1) / columns;
-            Size cell = _renderer.CellSize(box.ViewMode);
+            Size cell = _renderer.CellSize(box.CurrentViewMode);
             int h = needRows * cell.Height + headerH + _theme.BodyPadding * 2;
 
             if (h < GroupLayout.MinPanelHeight) h = GroupLayout.MinPanelHeight;
@@ -1890,7 +1915,10 @@ namespace DesktopIconManager.UI
 
                 if (box.Collapsed) continue;
 
-                bool listMode = (box.ViewMode == BoxViewMode.List);
+                // 当前分类自己的显示方式：组合后各分类可以各用各的布局。
+                // 注意别叫 view —— 上面的可视矩形已经占了这个名字（CS0136）
+                BoxViewMode itemView = box.CurrentViewMode;
+                bool listMode = (itemView == BoxViewMode.List);
 
                 // 把条目裁剪在面板内。
                 //
@@ -1911,7 +1939,7 @@ namespace DesktopIconManager.UI
                     for (int i = 0; i < box.Items.Count; i++)
                     {
                         Rectangle itemRect = _renderer.GetItemBounds(
-                            bounds, headerH, box.ViewMode, i);
+                            bounds, headerH, itemView, i);
 
                         if (!itemRect.IntersectsWith(body)) continue;
 
@@ -1939,7 +1967,7 @@ namespace DesktopIconManager.UI
                         else
                         {
                             _renderer.DrawItem(g, itemRect, icon,
-                                GroupPanelRenderer.Ellipsize(item.Name, 14), state, box.ViewMode);
+                                GroupPanelRenderer.Ellipsize(item.Name, 14), state, itemView);
                         }
                     }
                 }
@@ -2437,23 +2465,23 @@ namespace DesktopIconManager.UI
                 if (bbtn == 0)
                 {
                     bb.Locked = !bb.Locked;
+
+                    // 气泡正开着时，文字要立刻跟着状态变 ——
+                    // 「点了没反应」的很大一部分就是这里没刷新
+                    if (_tipText != null && _hoverBtnGroup == bgi)
+                        _tipText = TitleTipText(bb, bbtn);
+
+                    MarkDirty();
+                    Render();
                 }
                 else
                 {
-                    // 循环切换：大图标 → 小图标 → 列表 → 大图标
-                    bb.ViewMode = (BoxViewMode)(((int)bb.ViewMode + 1) % 3);
-                    AutoFitPanel(bgi);
+                    // 循环切换：大图标 → 小图标 → 列表 → 大图标。
+                    // 作用在**当前分类**上，格子大小不变（ApplyViewMode 内部已处理）
+                    FenceTab cur = bb.Current;
+                    ApplyViewMode(bgi, (BoxViewMode)(((int)bb.ViewModeOf(cur) + 1) % 3));
                 }
 
-                // 气泡正开着时，文字要立刻跟着状态变 ——
-                // 「点了没反应」的很大一部分就是这里没刷新
-                if (_tipText != null && _hoverBtnGroup == bgi)
-                {
-                    _tipText = TitleTipText(bb, bbtn);
-                }
-
-                MarkDirty();
-                Render();
                 return;
             }
 
@@ -3231,18 +3259,34 @@ namespace DesktopIconManager.UI
             menu.Show(this, location);
         }
 
-        /// <summary>右键菜单里的「布局」子菜单：大图标 / 小图标 / 列表。</summary>
+        /// <summary>右键菜单里的「布局」子菜单：大图标 / 小图标 / 列表（逐分类独立）。</summary>
         private void AddViewMenu(ContextMenuStrip menu, int gi)
         {
             if (menu == null) return;
             if (gi < 0 || gi >= _layout.Groups.Count) return;
 
             FenceBox box = _layout.Groups[gi];
-            var sub = new ToolStripMenuItem("布局");
+            FenceTab tab = box.Current;
+            var sub = new ToolStripMenuItem("当前分类的显示方式");
 
             AddViewItem(sub, box, gi, "大图标", BoxViewMode.LargeIcons);
             AddViewItem(sub, box, gi, "小图标", BoxViewMode.SmallIcons);
             AddViewItem(sub, box, gi, "列表", BoxViewMode.List);
+
+            // 已单独设置过的分类，给一个「跟随盒子默认」的退出口
+            if (tab != null && tab.ViewMode.HasValue)
+            {
+                var reset = new ToolStripMenuItem("跟随盒子默认（取消单独设置）");
+                reset.Click += delegate
+                {
+                    tab.ViewMode = null;
+                    EnsureTabFits(gi);
+                    MarkDirty();
+                    Render();
+                };
+                sub.DropDownItems.Add(new ToolStripSeparator());
+                sub.DropDownItems.Add(reset);
+            }
 
             menu.Items.Add(sub);
         }
@@ -3250,19 +3294,52 @@ namespace DesktopIconManager.UI
         private void AddViewItem(ToolStripMenuItem parent, FenceBox box, int gi,
                                  string text, BoxViewMode mode)
         {
+            FenceTab tab = box.Current;
             var item = new ToolStripMenuItem(text);
-            item.Checked = (box.ViewMode == mode);
+            item.Checked = (box.ViewModeOf(tab) == mode);
             item.Click += delegate
             {
-                if (box.ViewMode == mode) return;
+                if (box.ViewModeOf(tab) == mode) return;
 
-                box.ViewMode = mode;
-                // 换布局后单元格尺寸变了，面板要重新收紧
-                AutoFitPanel(gi);
-                MarkDirty();
-                Render();
+                ApplyViewMode(gi, mode);
             };
             parent.DropDownItems.Add(item);
+        }
+
+        /// <summary>
+        /// 切换**当前分类**的显示方式（大图标 / 小图标 / 列表）。
+        ///
+        /// ★ 两条硬性要求：
+        ///
+        /// 1. **只作用于当前分类**，同盒内其它分类不受影响。
+        ///    组合成格子组后各分类必须保持独立 —— 否则「文件夹用网格、
+        ///    快捷方式用列表」这种混排就不成立，一点切换就整盒跟着变。
+        ///    首次改动时把该分类当前的有效值固化下来，从此它自己说了算。
+        ///
+        /// 2. **格子大小不变**。
+        ///    以前调的是 AutoFitPanel —— 它按新单元格尺寸重算宽高，
+        ///    于是「点一下三横线」就把用户排好的版面整个改掉（列表模式还会
+        ///    把宽度按 ItemWidth*3 重算），体验上等于手滑把布局毁了。
+        ///    现在只在**装不下**时才增高，且不缩窄、不顶出屏幕 —— 见 EnsureTabFits。
+        /// </summary>
+        private void ApplyViewMode(int gi, BoxViewMode mode)
+        {
+            if (gi < 0 || gi >= _layout.Groups.Count) return;
+
+            FenceBox box = _layout.Groups[gi];
+            FenceTab tab = box.Current;
+
+            if (box.ViewModeOf(tab) == mode) return;
+
+            if (!tab.ViewMode.HasValue)
+                tab.ViewMode = box.ViewMode;   // 先固化当前值，从此独立于盒
+
+            tab.ViewMode = mode;
+
+            EnsureTabFits(gi);     // 只在装不下时增高，尺寸不变
+
+            MarkDirty();
+            Render();
         }
 
         /// <summary>

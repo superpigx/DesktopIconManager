@@ -6,6 +6,8 @@ title 桌面图标管理器
 
 echo.
 
+echo   双击 bin\DesktopIconManager.exe 也能直接启动桌面整理
+
 echo ============================================
 
 echo   构建 桌面图标管理器
@@ -160,6 +162,18 @@ echo.
 
 
 
+:rebuild
+
+echo.
+
+set /p choice=   [A] 已编译完成，现在直接启动桌面整理? [Y/N]:
+
+if /i not "%choice%"=="Y" goto menu
+
+bin\DesktopIconManager.exe --shell
+
+goto menu
+
 :menu
 
 echo ============================================
@@ -204,7 +218,13 @@ echo     [R] 恢复系统桌面图标（万一图标不见了就用这个）
 
 echo     [T] 设置          - 主题 / 尺寸 / 吸附 / 分类规则
 
+echo     [L] 布局诊断      - 打印存档解析结果：每个分类的条目数 / 显示方式
+
 echo.
+
+echo   【开发】
+
+echo     [A] 编译并立即启动（改完代码一步到位）
 
 echo     [0] 退出
 
@@ -240,6 +260,9 @@ if /i "%choice%"=="R" bin\DesktopIconManager.exe --show-icons
 if /i "%choice%"=="I" bin\DesktopIconManager.exe --stats
 
 if /i "%choice%"=="T" bin\DesktopIconManager.exe --settings
+if /i "%choice%"=="L" bin\DesktopIconManager.exe --dump-layout
+
+if /i "%choice%"=="A" goto rebuild
 
 if "%choice%"=="0" exit /b 0
 

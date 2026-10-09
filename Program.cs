@@ -13,8 +13,10 @@ namespace DesktopIconManager
     /// <summary>
     /// 桌面图标管理器。
     ///
-    /// 命令：
-    ///   --probe      阶段1：只读扫描桌面文件，输出分类统计（默认）
+    /// 命令（**不带参数时默认 --shell**，即双击 exe 就是启动桌面整理）：
+    ///   --shell      桌面覆盖层（核心功能，等价于 --gui / 不带参数）
+    ///   --dump-layout 只读诊断：打印存档解析后的布局全景 + 溢出/重复报告
+    ///   --probe      只读扫描桌面文件，输出分类统计
     ///   --diagnose   诊断桌面图层结构，检测冲突程序
     ///   --positions  只读列出当前图标坐标
     ///   --preview    预览布局方案，显示每个图标将移动到哪里（不写入）
@@ -63,9 +65,17 @@ namespace DesktopIconManager
             try { AppSettings.SetCurrent(AppSettings.Load(AppSettings.DefaultPath())); }
             catch { /* 设置文件损坏就用默认值，不能让程序起不来 */ }
 
-            string mode = "probe";
+            string mode;
+
+            // 无参数 = 双击 exe / 快捷方式 / 某些自启脚本的启动方式。
+            // 这种情况下最合理的默认行为是「启动桌面覆盖层」——
+            // 以前默认跑 probe，用户双击后只看到一堆统计然后窗口消失，
+            // 表现为「直接运行 exe 没有用」。
+            // 需要只读探测必须显式写 --probe（脚本里也该写全，语义更清楚）。
             if (args.Length > 0 && !string.IsNullOrEmpty(args[0]))
                 mode = args[0].TrimStart('-').ToLowerInvariant();
+            else
+                mode = "shell";
 
             switch (mode)
             {
@@ -81,6 +91,9 @@ namespace DesktopIconManager
                 case "show-icons": return RunShowIcons();
                 case "stats":     return RunStats();
                 case "dump-layout": return RunDumpLayout();
+                case "gui": case "start": case "run":
+                    // --gui / --start / --run：给快捷方式用的显式别名
+                    return RunShell(args);
                 default:
                     PrintUsage();
                     return 1;
@@ -1079,9 +1092,11 @@ namespace DesktopIconManager
                         FenceTab t = b.Tabs[ti];
                         totalItems += t.Items.Count;
 
+                        // 容量按该分类自己的有效显示方式算（没单独设置就跟盒）
+                        BoxViewMode vmode = b.ViewModeOf(t);
                         int headerH = renderer.HeaderHeight(b.Tabs.Count);
                         int cols, rows;
-                        renderer.MeasureCapacity(b.Bounds, headerH, b.ViewMode,
+                        renderer.MeasureCapacity(b.Bounds, headerH, vmode,
                                                  out cols, out rows);
                         int capacity = cols * rows;
 
@@ -1091,6 +1106,8 @@ namespace DesktopIconManager
                         Console.WriteLine("  │  · " + (ti + 1) + " " + title
                             + "  条目 " + t.Items.Count
                             + "  容量 " + cols + "×" + rows + "=" + capacity
+                            + "  显示=" + ViewName(vmode)
+                            + (t.ViewMode.HasValue ? "(独立)" : "(跟盒)")
                             + flag);
 
                         if (t.Items.Count > capacity)
@@ -1311,6 +1328,9 @@ namespace DesktopIconManager
         private static void PrintUsage()
         {
             Console.WriteLine("桌面图标管理器");
+            Console.WriteLine();
+            Console.WriteLine("  ★ 直接双击 exe（不带任何参数）= 启动桌面覆盖层");
+            Console.WriteLine("    只读探测请显式加 --probe");
             Console.WriteLine();
             Console.WriteLine("用法: DesktopIconManager.exe [命令]");
             Console.WriteLine();
