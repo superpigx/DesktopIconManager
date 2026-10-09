@@ -230,12 +230,28 @@ namespace DesktopIconManager.UI
         public static bool Edit(IWin32Window owner, AppSettings target, PreviewHandler preview,
                                 ThemePalette uiTheme)
         {
+            return EditAt(owner, target, preview, uiTheme, -1);
+        }
+
+        /// <summary>
+        /// 打开设置窗口并定位到指定导航页。
+        ///
+        /// 菜单里的「改变外观」「整理规则设定」就是靠它直达对应页 ——
+        /// 让用户从任意界面一步跳到他真正想改的地方。
+        /// </summary>
+        /// <param name="pageIndex">导航下标；-1 表示用默认页。</param>
+        public static bool EditAt(IWin32Window owner, AppSettings target, PreviewHandler preview,
+                                  ThemePalette uiTheme, int pageIndex)
+        {
             if (target == null) return false;
 
             AppSettings work = target.Clone();
 
             using (var f = new SettingsForm(work, preview, uiTheme))
             {
+                if (pageIndex >= 0 && pageIndex < f._nav.Items.Count)
+                    f._nav.SelectedIndex = pageIndex;
+
                 if (f.ShowDialog(owner) != DialogResult.OK) return false;
                 target.CopyFrom(work);
 

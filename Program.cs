@@ -703,6 +703,13 @@ namespace DesktopIconManager
                                       + " 个条目因路径不合法被忽略（详见日志）。");
                 }
 
+                // ---- 启动时自动整理（设置里的开关，默认开）----
+                PerfStats.BeginPhase("自动整理");
+                int organized = AutoOrganize(layout);
+                PerfStats.EndPhase();
+                if (organized > 0)
+                    Console.WriteLine("  已自动整理 " + organized + " 个条目（按整理规则）");
+
                 // 修正历史数据里可能残留的面板重叠
                 // （旧版存在尺寸口径不一致的缺陷，会把重叠坐标写进存档）
                 int fixedCount = layout.ResolveOverlaps(SystemInformation.VirtualScreen.Width);
@@ -839,6 +846,168 @@ namespace DesktopIconManager
 
             Footer("覆盖层已关闭 · 系统桌面图标已恢复");
             return 0;
+        }
+
+        /// <summary>
+        /// 启动时自动整理：把错位的条目按整理规则归回各自分区。
+        ///
+        /// 三条规则（对应设置「整理规则」页顶部）：
+        ///   · 关掉「程序启动时自动整理」→ 完全不动用户的布局
+        ///   · 「整理到固定分区」→ 所有条目汇到一个指定分区
+        ///   · 「按照整理规则」→ 逐盒重新归类，但**跳过**勾了
+        ///     「从快捷隐藏中排除」的分类 —— 用户手工摆的位不该被动
+        ///
+        /// 只调整**面板归属**，不移动、不删除任何文件。
+        /// </summary>
+        /// <returns>被挪动的条目数</returns>
+        private static int AutoOrganize(GroupLayout layout)
+        {
+            if (layout == null) return 0;
+
+            AppSettings cfg = AppSettings.Current;
+            if (cfg == null || !cfg.AutoOrganizeOnStartup) return 0;
+
+            int moved = 0;
+
+            try
+            {
+                if (cfg.OrganizeMode == AutoOrganizeMode.FixedPartition)
+                {
+                    string target = string.IsNullOrEmpty(cfg.FixedPartition)
+                        ? "未归类" : cfg.FixedPartition;
+
+                    foreach (FenceBox box in layout.Groups)
+                    {
+                        // 排除项不参与 —— 它们留在原盒原位
+                        for (int i = 0; i < box.Tabs.Count; i++)
+                        {
+                            if (box.Tabs[i].ExcludeFromAutoOrganize) continue;
+                            moved += MergeTabInto(layout, box, box.Tabs[i], target);
+                        }
+                    }
+                }
+                else
+                {
+                    // 先记住每个盒当前停在哪个分类 ——
+                    // ReclassifyInPlace 内部会把 ActiveTab 归 0，
+                    // 不还原的话，用户开机后看到的一律是第一个分类。
+                    var keepActive = new Dictionary<FenceBox, int>();
+                    foreach (FenceBox box in layout.Groups)
+                        keepActive[box] = box.ActiveTab;
+
+                    foreach (FenceBox box in layout.Groups)
+                    {
+                        bool anyNormal = false;
+                        foreach (FenceTab tab in box.Tabs)
+                            if (!tab.ExcludeFromAutoOrganize) { anyNormal = true; break; }
+
+                        if (!anyNormal) continue;
+
+                        string activeTitle = null;
+                        if (keepActive[box] >= 0 && keepActive[box] < box.Tabs.Count)
+                            activeTitle = box.Tabs[keepActive[box]].Title;
+
+                        moved += box.ReclassifyInPlace(new Classifier());
+
+                        // 按**标题**还原（重新归类可能重排甚至删掉分类，下标不可靠）
+                        if (!string.IsNullOrEmpty(activeTitle))
+                        {
+                            for (int i = 0; i < box.Tabs.Count; i++)
+                            {
+                                if (string.Equals(box.Tabs[i].Title, activeTitle,
+                                                  StringComparison.CurrentCulture))
+                                {
+                                    box.ActiveTab = i;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error("启动自动整理失败（已跳过，不影响启动）", ex);
+                return 0;
+            }
+
+            if (moved > 0)
+            {
+                try { layout.Save(GroupLayout.DefaultPath()); }
+                catch { }
+            }
+
+            return moved;
+        }
+
+        /// <summary>
+        /// 把一个分类的条目并入名为 <paramref name="targetPartition"/> 的分区。
+        /// 找不到同名分区就新建一个。返回挪动的条目数。
+        /// </summary>
+        private static int MergeTabInto(GroupLayout layout, FenceBox src,
+                                       FenceTab tab, string targetPartition)
+        {
+            int moved = 0;
+
+            FenceBox dst = null;
+            foreach (FenceBox b in layout.Groups)
+            {
+                if (ReferenceEquals(b, src)) continue;
+                foreach (FenceTab t in b.Tabs)
+                {
+                    if (string.Equals(t.Title, targetPartition, StringComparison.CurrentCulture))
+                    {
+                        dst = b;
+                        break;
+                    }
+                }
+                if (dst != null) break;
+            }
+
+            if (dst == null)
+            {
+                dst = new FenceBox();
+                dst.Title = targetPartition;
+
+                // 放在源盒右边，避免叠在一起
+                Rectangle screen = SystemInformation.VirtualScreen;
+                int x = src.Bounds.Right + 12;
+                if (x + src.Bounds.Width > screen.Right)
+                {
+                    x = src.Bounds.Left;
+                    int y = src.Bounds.Bottom + 12;
+                    if (y + src.Bounds.Height > screen.Bottom) y = screen.Top + 24;
+                    dst.Bounds = new Rectangle(x, y, src.Bounds.Width, src.Bounds.Height);
+                }
+                else
+                {
+                    dst.Bounds = new Rectangle(x, src.Bounds.Y,
+                        src.Bounds.Width, src.Bounds.Height);
+                }
+
+                layout.Groups.Add(dst);
+            }
+
+            foreach (GroupItem it in tab.Items)
+            {
+                bool dup = false;
+                foreach (GroupItem old in dst.Items)
+                {
+                    if (string.Equals(old.FullPath, it.FullPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        dup = true;
+                        break;
+                    }
+                }
+
+                if (dup) continue;
+
+                dst.Items.Add(it);
+                moved++;
+            }
+
+            tab.Items.Clear();
+            return moved;
         }
 
         /// <summary>开启 Per-Monitor DPI 感知，保证高缩放下的坐标准确。</summary>

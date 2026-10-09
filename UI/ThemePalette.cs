@@ -98,6 +98,20 @@ namespace DesktopIconManager.UI
         public int IconSize { get; set; }
         /// <summary>小图标网格模式下的图标边长。</summary>
         public int SmallIconSize { get; set; }
+
+        /// <summary>
+        /// 中等图标边长（介于 IconSize 与 SmallIconSize 之间）。
+        ///
+        /// 不做成独立设置项 —— 它只是为了对齐参考实现的四档视图，
+        /// 用户几乎不会单独调它。ThemeBinder 按大小图标的均值派生。
+        /// </summary>
+        public int MediumIconSize { get; set; }
+
+        /// <summary>中等图标单元格宽（派生值，见 <see cref="MediumIconSize"/>）。</summary>
+        public int MediumItemWidth { get; set; }
+
+        /// <summary>中等图标单元格高（派生值）。</summary>
+        public int MediumItemHeight { get; set; }
         /// <summary>小图标网格模式下的单元格高度。</summary>
         public int SmallItemHeight { get; set; }
         /// <summary>列表模式下一行的高度。</summary>
@@ -179,6 +193,9 @@ namespace DesktopIconManager.UI
                 ItemHeight = 82,
                 IconSize = 48,
                 SmallIconSize = 32,
+                MediumIconSize = 40,
+                MediumItemWidth = 62,
+                MediumItemHeight = 72,
                 SmallItemHeight = 62,
                 ListRowHeight = 22,
                 ListIconSize = 16,

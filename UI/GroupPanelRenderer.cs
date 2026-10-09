@@ -569,7 +569,10 @@ namespace DesktopIconManager.UI
             }
 
             // 图标尺寸随布局变化，但不超过单元格
-            int iconSize = (view == BoxViewMode.SmallIcons) ? _theme.SmallIconSize : _theme.IconSize;
+            int iconSize;
+            if (view == BoxViewMode.SmallIcons) iconSize = _theme.SmallIconSize;
+            else if (view == BoxViewMode.MediumIcons) iconSize = _theme.MediumIconSize;
+            else iconSize = _theme.IconSize;
             if (iconSize > bounds.Width - 4) iconSize = Math.Max(16, bounds.Width - 4);
 
             // 图标居中偏上
@@ -1292,6 +1295,9 @@ namespace DesktopIconManager.UI
 
                 case BoxViewMode.SmallIcons:
                     return new Size(_theme.ItemWidth, _theme.SmallItemHeight);
+
+                case BoxViewMode.MediumIcons:
+                    return new Size(_theme.MediumItemWidth, _theme.MediumItemHeight);
 
                 default:
                     return new Size(_theme.ItemWidth, _theme.ItemHeight);

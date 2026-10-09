@@ -212,6 +212,14 @@ namespace DesktopIconManager.Core
         /// <summary>是否降序（仅对非 Manual 有意义）。再点一次同一模式即切换方向。</summary>
         public bool SortDescending { get; set; }
 
+        /// <summary>
+        /// 「从快捷隐藏中排除」——勾上后该分类**不参与启动时的自动整理**。
+        ///
+        /// 语义对齐参考实现：手工摆好的一堆文件，下次启动不该被规则打散。
+        /// 逐分类生效（不是整盒），因为同一盒里不同分类的意愿可能不同。
+        /// </summary>
+        public bool ExcludeFromAutoOrganize { get; set; }
+
         // ---- 排序结果缓存（不进存档）----
         // 渲染每帧都要用顺序表，不能每帧都排序；条目增删会让 Items.Count 变化，
         // 缓存签名因此自动失效，无需到处手动清。
@@ -345,7 +353,14 @@ namespace DesktopIconManager.Core
         /// <summary>小图标网格 —— 一屏能放下更多。</summary>
         SmallIcons = 1,
         /// <summary>列表 —— 每行一项，适合名字长的文件。</summary>
-        List = 2
+        List = 2,
+        /// <summary>
+        /// 中等图标网格 —— 介于大与小之间。
+        ///
+        /// 追加在末尾（值 3）而不是插在中间：存档里存的是数字，
+        /// 插在中间会让所有旧存档的「小图标」集体变成「中等图标」。
+        /// </summary>
+        MediumIcons = 3
     }
 
     /// <summary>
@@ -664,6 +679,23 @@ namespace DesktopIconManager.Core
         /// <summary>上次载入时因路径不合法而被丢弃的条目数（0 表示存档干净）。</summary>
         public static int LastLoadSkipped { get; private set; }
 
+        /// <summary>
+        /// 存档里的布局数字 → 枚举。
+        ///
+        /// 集中一处解析，新增档位时不会漏掉某个调用点
+        /// （此前 0/1/2 的三元表达式散落在 G 行与 T 行两处，加档位必漏）。
+        /// </summary>
+        public static BoxViewMode ParseViewMode(int v)
+        {
+            switch (v)
+            {
+                case 1: return BoxViewMode.SmallIcons;
+                case 2: return BoxViewMode.List;
+                case 3: return BoxViewMode.MediumIcons;
+                default: return BoxViewMode.LargeIcons;
+            }
+        }
+
         // ============================================================
         //  保存 / 载入
         // ============================================================
@@ -717,6 +749,10 @@ namespace DesktopIconManager.Core
                         sb.Append('\t').Append((int)tab.SortMode)
                           .Append('\t').Append(tab.SortDescending ? "1" : "0");
                     }
+
+                    // 第 13 列（可选）：是否「从快捷隐藏中排除」
+                    if (tab.ExcludeFromAutoOrganize)
+                        sb.Append('\t').Append("1");
 
                     sb.Append("\r\n");
 
@@ -811,9 +847,7 @@ namespace DesktopIconManager.Core
                     box.ActiveTab = active;
                     box.Locked = locked;
                     box.TabBarCollapsed = tabCollapsed;
-                    box.ViewMode = (view == 1) ? BoxViewMode.SmallIcons
-                                 : (view == 2) ? BoxViewMode.List
-                                 : BoxViewMode.LargeIcons;
+                    box.ViewMode = ParseViewMode(view);
 
                     layout.Groups.Add(box);
                     curTab = null;           // 新盒还没有当前分类
@@ -844,9 +878,7 @@ namespace DesktopIconManager.Core
                             ov = 0;
                             if (p.Length >= 7) int.TryParse(p[6], out ov);
 
-                            BoxViewMode vm = (ov == 1) ? BoxViewMode.SmallIcons
-                                           : (ov == 2) ? BoxViewMode.List
-                                           : BoxViewMode.LargeIcons;
+                            BoxViewMode vm = ParseViewMode(ov);
 
                             bool oLock = p.Length >= 8 && p[7] == "1";
                             bool oCol = p.Length >= 9 && p[8] == "1";
@@ -882,6 +914,9 @@ namespace DesktopIconManager.Core
                             tab.SortDescending = (p.Length >= 12 && p[11] == "1");
                         }
                     }
+
+                    // 第 13 列（可选）：从快捷隐藏中排除
+                    if (p.Length >= 13) tab.ExcludeFromAutoOrganize = (p[12] == "1");
 
                     box.Tabs.Add(tab);
                     curTab = tab;              // ← 后续 I 行写进这个分类

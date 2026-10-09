@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 
 namespace DesktopIconManager.Core
@@ -183,6 +184,77 @@ namespace DesktopIconManager.Core
             if (string.IsNullOrEmpty(path)) return false;
             try { return File.Exists(path) || Directory.Exists(path); }
             catch { return false; }
+        }
+
+        /// <summary>
+        /// 为目标创建一个 .lnk 快捷方式（供右键菜单「粘贴快捷方式」用）。
+        ///
+        /// 走系统自带的 WScript.Shell：它内部就是 IShellLink 的封装，
+        /// 用 late binding 调用，既不需要引用互操作程序集，
+        /// 也不会像手写 vtable 那样容易错位。
+        /// 任何一步失败都返回 false，由调用方跳过这一项。
+        /// </summary>
+        public static bool CreateShortcut(string target, string linkPath)
+        {
+            if (string.IsNullOrEmpty(target) || string.IsNullOrEmpty(linkPath)) return false;
+            if (!Exists(target)) return false;
+
+            object shell = null;
+            object link = null;
+
+            try
+            {
+                Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null) return false;
+
+                shell = Activator.CreateInstance(shellType);
+                if (shell == null) return false;
+
+                link = shellType.InvokeMember("CreateShortcut",
+                    BindingFlags.InvokeMethod, null, shell, new object[] { linkPath });
+
+                if (link == null) return false;
+
+                Type linkType = link.GetType();
+                linkType.InvokeMember("TargetPath", BindingFlags.SetProperty,
+                    null, link, new object[] { target });
+                linkType.InvokeMember("WorkingDirectory", BindingFlags.SetProperty,
+                    null, link, new object[] { Path.GetDirectoryName(target) });
+                linkType.InvokeMember("Save", BindingFlags.InvokeMethod,
+                    null, link, null);
+
+                return Exists(linkPath);
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                Release(link);
+                Release(shell);
+            }
+        }
+
+        /// <summary>
+        /// 释放 COM 对象。
+        ///
+        /// WScript.Shell 这类对象不显式释放会一直挂在进程的 COM 表里，
+        /// 反复「粘贴快捷方式」几次就会攒出可观的句柄与内存。
+        /// </summary>
+        private static void Release(object comObject)
+        {
+            if (comObject == null) return;
+
+            try
+            {
+                if (Marshal.IsComObject(comObject))
+                    Marshal.ReleaseComObject(comObject);
+            }
+            catch
+            {
+                // 已经不是 COM 对象了，无所谓
+            }
         }
 
         /// <summary>

@@ -1,4 +1,5 @@
-﻿using System.Drawing;
+﻿using System;
+using System.Drawing;
 using System.Windows.Forms;
 using DesktopIconManager.Core;
 
@@ -74,6 +75,11 @@ namespace DesktopIconManager.UI
             p.ItemWidth = s.ItemWidth;
             p.ItemHeight = s.ItemHeight;
             p.SmallIconSize = s.SmallIconSize;
+
+            // 中等档由大小图标派生 —— 不新增设置项，避免设置页越堆越杂
+            p.MediumIconSize = (s.IconSize + s.SmallIconSize) / 2;
+            p.MediumItemWidth = Math.Max(48, (s.ItemWidth * 4) / 5);
+            p.MediumItemHeight = (s.ItemHeight + s.SmallItemHeight) / 2;
             p.SmallItemHeight = s.SmallItemHeight;
             p.ListRowHeight = s.ListRowHeight;
             p.ListIconSize = s.ListIconSize;

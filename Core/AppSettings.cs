@@ -285,8 +285,10 @@ namespace DesktopIconManager.Core
             DisabledCategories = new List<string>();
             AutoStart = false;
 
-            // 自动整理
-            AutoOrganizeOnStartup = true;
+            // 自动整理：**默认关闭**。
+            // 开启后每次启动都会按规则重排条目，等于「用户没做任何操作，
+            // 布局却被程序改了」—— 这类默认行为必须由用户显式选择。
+            AutoOrganizeOnStartup = false;
             OrganizeMode = AutoOrganizeMode.ByRules;
             FixedPartition = "其它";
             PartitionMap = new List<string>();

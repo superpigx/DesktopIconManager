@@ -3277,6 +3277,17 @@ namespace DesktopIconManager.UI
         //  右键菜单
         // ============================================================
 
+        /// <summary>
+        /// 收纳盒内的右键菜单。
+        ///
+        /// 结构对齐参考实现（Fences）：
+        ///   查看 ▸ / 排序方式 ▸ / 刷新 / 粘贴 / 粘贴快捷方式 /
+        ///   从快捷隐藏中排除 / ☑改变外观 / ☑整理规则设定 /
+        ///   ☑重命名 / ☑解散当前分类 / ☑解散收纳盒 / 新建(W) ▸
+        ///
+        /// 勾号（Checked）表示「该项对应的能力已启用」，与参考实现一致。
+        /// 高阶但少用的操作收进「更多操作」，避免主菜单被拉得过长。
+        /// </summary>
         private void ShowContextMenu(Point location)
         {
             int gi = HitGroupBody(location);
@@ -3286,80 +3297,262 @@ namespace DesktopIconManager.UI
             if (gi >= 0)
             {
                 FenceBox box = _layout.Groups[gi];
+                int at = Math.Max(0, Math.Min(box.ActiveTab, box.Tabs.Count - 1));
 
-                menu.Items.Add("重命名当前分类", null, delegate { RenameGroup(gi); });
-                menu.Items.Add("新建分类", null, delegate { AddTab(gi); });
-
-                // 按分类规则把错位条目归回自己的 tab（exe 回「程序」这类），
-                // 组合结构不动，文件也不动
-                menu.Items.Add("重新归类此盒", null, delegate
-                {
-                    int moved = box.ReclassifyInPlace(new Classifier());
-                    MarkDirty(); Render();
-                    if (moved > 0) AutoFitPanel(gi);
-                });
-
-                // 布局与排序：都是**逐分类独立**设置，组合后互不干扰
+                // ---- 查看 ▸（四档视图）/ 排序方式 ▸ ----
                 AddViewMenu(menu, gi);
                 AddSortMenu(menu, gi);
 
-                menu.Items.Add("折叠 / 展开", null, delegate
+                menu.Items.Add("刷新", null, delegate { RefreshBox(gi); });
+                menu.Items.Add(new ToolStripSeparator());
+
+                // ---- 粘贴 / 粘贴快捷方式（剪贴板无文件时置灰）----
+                bool hasFiles = ClipboardHasFiles();
+
+                var miPaste = new ToolStripMenuItem("粘贴");
+                miPaste.Enabled = hasFiles;
+                miPaste.Click += delegate { PasteFromClipboard(gi, false); };
+                menu.Items.Add(miPaste);
+
+                var miPasteLnk = new ToolStripMenuItem("粘贴快捷方式");
+                miPasteLnk.Enabled = hasFiles;
+                miPasteLnk.Click += delegate { PasteFromClipboard(gi, true); };
+                menu.Items.Add(miPasteLnk);
+
+                menu.Items.Add(new ToolStripSeparator());
+
+                // ---- 从快捷隐藏中排除 ----
+                // 语义：该分类不参与「启动时自动整理」，
+                // 手动收进来的文件不会被下次启动按规则打散
+                FenceTab cur = box.Current;
+                var miExclude = new ToolStripMenuItem("从快捷隐藏中排除");
+                miExclude.Checked = cur.ExcludeFromAutoOrganize;
+                miExclude.Click += delegate
+                {
+                    FenceTab tab = _layout.Groups[gi].Current;
+                    tab.ExcludeFromAutoOrganize = !tab.ExcludeFromAutoOrganize;
+                    MarkDirty();
+                    Render();
+                };
+                menu.Items.Add(miExclude);
+
+                // ---- 改变外观 / 整理规则设定：直达设置对应页 ----
+                var miLook = new ToolStripMenuItem("改变外观");
+                miLook.Checked = true;
+                miLook.Click += delegate { OpenSettingsAt(0); };
+                menu.Items.Add(miLook);
+
+                var miRules = new ToolStripMenuItem("整理规则设定");
+                miRules.Checked = true;
+                miRules.Click += delegate { OpenSettingsAt(3); };
+                menu.Items.Add(miRules);
+
+                menu.Items.Add(new ToolStripSeparator());
+
+                // ---- 重命名 / 解散当前分类 / 解散收纳盒 ----
+                var miRename = new ToolStripMenuItem("重命名");
+                miRename.Checked = true;
+                miRename.Click += delegate { RenameGroup(gi); };
+                menu.Items.Add(miRename);
+
+                var miDissolveTab = new ToolStripMenuItem("解散当前分类");
+                miDissolveTab.Checked = true;
+                miDissolveTab.Enabled = (box.Tabs.Count > 1);
+                miDissolveTab.Click += delegate { RemoveTab(gi, at); };
+                menu.Items.Add(miDissolveTab);
+
+                var miDissolveBox = new ToolStripMenuItem("解散收纳盒");
+                miDissolveBox.Checked = true;
+                miDissolveBox.Click += delegate { RemoveGroup(gi); };
+                menu.Items.Add(miDissolveBox);
+
+                menu.Items.Add(new ToolStripSeparator());
+
+                // ---- 新建(W) ▸ ----
+                var miNew = new ToolStripMenuItem("新建(W)");
+                miNew.DropDownItems.Add("收纳盒分类", null, delegate { AddTab(gi); });
+                miNew.DropDownItems.Add("独立收纳盒", null, delegate { AddGroup(location); });
+                menu.Items.Add(miNew);
+
+                // ---- 更多操作 ----
+                var miMore = new ToolStripMenuItem("更多操作");
+                miMore.DropDownItems.Add("折叠 / 展开", null, delegate
                 {
                     _layout.Groups[gi].Collapsed = !_layout.Groups[gi].Collapsed;
                     MarkDirty(); Render();
                 });
-
-                // 组合 / 合并到其他收纳盒（也可以直接把标题栏拖到目标盒上）
-                if (_layout.Groups.Count > 1)
+                miMore.DropDownItems.Add("重新归类此盒", null, delegate
                 {
-                    menu.Items.Add(new ToolStripSeparator());
-                    AddCombineMenu(menu, gi);
-                    AddMergeMenu(menu, gi);
-                }
+                    int moved = _layout.Groups[gi].ReclassifyInPlace(new Classifier());
+                    MarkDirty(); Render();
+                    if (moved > 0) AutoFitPanel(gi);
+                });
 
                 if (box.Tabs.Count > 1)
                 {
-                    int at = Math.Max(0, Math.Min(box.ActiveTab, box.Tabs.Count - 1));
-
-                    menu.Items.Add(new ToolStripSeparator());
-
-                    // 有原始位置记录时明确告诉用户「会回到原位」，
-                    // 否则他无法预知拆出来会散到哪儿
-                    menu.Items.Add("解散格子组（拆成 " + box.Tabs.Count + " 个独立收纳盒" +
-                                   (box.HasUsableOrigin ? " · 回到原位" : "") + "）",
-                        null, delegate { DissolveGroup(gi); });
-
-                    menu.Items.Add(new ToolStripSeparator());
-
                     bool restore = box.Tabs[at].Origin != null && box.Tabs[at].Origin.IsUsable;
-                    menu.Items.Add("拆出当前分类为独立收纳盒" + (restore ? "（回到原位）" : ""),
-                        null, delegate { DetachTab(gi, at); });
 
-                    menu.Items.Add("解散当前分类",
-                        null, delegate { RemoveTab(gi, at); });
+                    miMore.DropDownItems.Add(new ToolStripSeparator());
+                    miMore.DropDownItems.Add("拆出当前分类为独立收纳盒" +
+                        (restore ? "（回到原位）" : ""), null, delegate { DetachTab(gi, at); });
+                    miMore.DropDownItems.Add("解散格子组（拆成 " + box.Tabs.Count +
+                        " 个独立收纳盒" + (box.HasUsableOrigin ? " · 回到原位" : "") + "）",
+                        null, delegate { DissolveGroup(gi); });
                 }
 
-                menu.Items.Add(new ToolStripSeparator());
-                menu.Items.Add("解散收纳盒", null, delegate { RemoveGroup(gi); });
-                menu.Items.Add(new ToolStripSeparator());
+                if (_layout.Groups.Count > 1)
+                {
+                    miMore.DropDownItems.Add(new ToolStripSeparator());
+                    AddCombineMenu(miMore.DropDownItems, gi);
+                    AddMergeMenu(miMore.DropDownItems, gi);
+                }
+
+                menu.Items.Add(miMore);
             }
 
-            menu.Items.Add("新建收纳盒", null, delegate { AddGroup(location); });
-            menu.Items.Add("重新归类全部盒子（保持组合）", null, delegate
-            {
-                if (_layout.ReclassifyAll(new Classifier()) > 0)
-                {
-                    MarkDirty();
-                    ResizeAllToContent();
-                    Render();
-                }
-            });
-            menu.Items.Add("按分类重新分组", null, delegate { RebuildFromDesktop(); });
-            menu.Items.Add("清理已失效条目", null, delegate { PruneMissing(); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("保存布局  (Ctrl+S)", null, delegate { SaveIfDirty(); });
 
             menu.Show(this, location);
+        }
+
+        /// <summary>剪贴板里是否有文件（决定「粘贴」是否可点）。</summary>
+        private static bool ClipboardHasFiles()
+        {
+            try
+            {
+                if (!Clipboard.ContainsFileDropList()) return false;
+                return Clipboard.GetFileDropList().Count > 0;
+            }
+            catch
+            {
+                // 剪贴板被别的进程占用是常事，不能因此让菜单打不开
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 把剪贴板里的文件收进当前分类。
+        ///
+        /// shortcutOnly = true 时创建 .lnk 快捷方式而不是移动原文件。
+        /// 只读取剪贴板，**不清空**它 —— 用户往往还要粘到别处。
+        /// </summary>
+        private void PasteFromClipboard(int gi, bool shortcutOnly)
+        {
+            if (gi < 0 || gi >= _layout.Groups.Count) return;
+
+            int added = 0;
+
+            try
+            {
+                System.Collections.Specialized.StringCollection paths =
+                    Clipboard.GetFileDropList();
+                if (paths == null) return;
+
+                FenceBox box = _layout.Groups[gi];
+
+                foreach (string fp in paths)
+                {
+                    if (string.IsNullOrEmpty(fp)) continue;
+
+                    bool isDir = Directory.Exists(fp);
+                    if (shortcutOnly && isDir) continue;   // 目录建快捷方式没意义
+
+                    string target = fp;
+                    string name = System.IO.Path.GetFileNameWithoutExtension(fp);
+
+                    if (shortcutOnly)
+                    {
+                        string dir = System.IO.Path.Combine(AppPaths.DataDirectory, "shortcuts");
+                        string lnk = System.IO.Path.Combine(dir,
+                            Guid.NewGuid().ToString("N").Substring(0, 8) + ".lnk");
+
+                        try
+                        {
+                            Directory.CreateDirectory(dir);
+                            ShellLauncher.CreateShortcut(fp, lnk);
+                        }
+                        catch
+                        {
+                            continue;   // 建不出来就跳过，不影响其余条目
+                        }
+
+                        target = lnk;
+                        name = System.IO.Path.GetFileName(fp);
+                    }
+
+                    box.Items.Add(new GroupItem(name, target, isDir));
+                    added++;
+                }
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error("从剪贴板粘贴失败", ex);
+            }
+
+            if (added <= 0) return;
+
+            AutoFitPanel(gi);
+            MarkDirty();
+            Render();
+        }
+
+        /// <summary>
+        /// 刷新：剔除该盒里已不存在的条目，并按规则重新归类。
+        /// 对应参考实现的「刷新」—— 不重读桌面、不动任何文件。
+        /// </summary>
+        private void RefreshBox(int gi)
+        {
+            if (gi < 0 || gi >= _layout.Groups.Count) return;
+
+            FenceBox box = _layout.Groups[gi];
+            int pruned = 0, moved = 0;
+
+            foreach (FenceTab tab in box.Tabs)
+            {
+                for (int i = tab.Items.Count - 1; i >= 0; i--)
+                {
+                    string fp = tab.Items[i].FullPath;
+                    bool exists;
+                    try { exists = Directory.Exists(fp) || File.Exists(fp); }
+                    catch { exists = false; }
+
+                    if (!exists)
+                    {
+                        tab.Items.RemoveAt(i);
+                        pruned++;
+                    }
+                }
+            }
+
+            // 「从快捷隐藏中排除」的分类不参与归类 —— 用户手工摆的位不该被动
+            bool excluded = true;
+            foreach (FenceTab tab in box.Tabs)
+                if (!tab.ExcludeFromAutoOrganize) { excluded = false; break; }
+
+            if (!excluded) moved = box.ReclassifyInPlace(new Classifier());
+
+            AutoFitPanel(gi);
+            MarkDirty();
+            Render();
+
+            AppLog.Info("刷新收纳盒「" + box.Title + "」：清理 " + pruned
+                + " 项，重新归类 " + moved + " 项");
+        }
+
+        /// <summary>打开设置窗口并定位到指定页（0=外观，3=整理规则）。</summary>
+        private void OpenSettingsAt(int pageIndex)
+        {
+            try
+            {
+                SettingsForm.EditAt(this, AppSettings.Current,
+                    delegate (AppSettings w) { ApplySettings(w); },
+                    _theme, pageIndex);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error("打开设置失败", ex);
+            }
         }
 
         /// <summary>右键菜单里的「布局」子菜单：大图标 / 小图标 / 列表（逐分类独立）。</summary>
@@ -3370,9 +3563,11 @@ namespace DesktopIconManager.UI
 
             FenceBox box = _layout.Groups[gi];
             FenceTab tab = box.Current;
-            var sub = new ToolStripMenuItem("当前分类的显示方式");
+            var sub = new ToolStripMenuItem("查看");
 
+            // 四档顺序与参考实现一致：大图标 / 中等图标 / 小图标 / 列表
             AddViewItem(sub, box, gi, "大图标", BoxViewMode.LargeIcons);
+            AddViewItem(sub, box, gi, "中等图标", BoxViewMode.MediumIcons);
             AddViewItem(sub, box, gi, "小图标", BoxViewMode.SmallIcons);
             AddViewItem(sub, box, gi, "列表", BoxViewMode.List);
 
@@ -3424,12 +3619,13 @@ namespace DesktopIconManager.UI
             FenceTab tab = box.Current;
             var sub = new ToolStripMenuItem("排序方式");
 
-            AddSortItem(sub, gi, "手动顺序（拖放原序）", BoxSortMode.Manual);
+            // 选项措辞对齐参考实现：名称 / 大小 / 项目类型 / 修改时间
+            AddSortItem(sub, gi, "名称", BoxSortMode.Name);
+            AddSortItem(sub, gi, "大小", BoxSortMode.Size);
+            AddSortItem(sub, gi, "项目类型", BoxSortMode.Kind);
+            AddSortItem(sub, gi, "修改时间", BoxSortMode.Modified);
             sub.DropDownItems.Add(new ToolStripSeparator());
-            AddSortItem(sub, gi, "按名称", BoxSortMode.Name);
-            AddSortItem(sub, gi, "按类型", BoxSortMode.Kind);
-            AddSortItem(sub, gi, "按大小", BoxSortMode.Size);
-            AddSortItem(sub, gi, "按修改时间", BoxSortMode.Modified);
+            AddSortItem(sub, gi, "手动顺序（拖放原序）", BoxSortMode.Manual);
 
             if (tab.SortMode != BoxSortMode.Manual)
             {
@@ -3532,7 +3728,7 @@ namespace DesktopIconManager.UI
         ///
         /// 这正是参考实现的行为 —— 组合成组，各分类各归各的，而不是把条目混在一起。
         /// </summary>
-        private void AddCombineMenu(ContextMenuStrip menu, int gi)
+        private void AddCombineMenu(ToolStripItemCollection menu, int gi)
         {
             if (menu == null) return;
             if (gi < 0 || gi >= _layout.Groups.Count) return;
@@ -3556,7 +3752,7 @@ namespace DesktopIconManager.UI
                     null, delegate { CombineAsGroup(gi, target); });
             }
 
-            menu.Items.Add(sub);
+            menu.Add(sub);
         }
 
         /// <summary>
@@ -3565,7 +3761,7 @@ namespace DesktopIconManager.UI
         /// 与「组合」的区别：组合保留各分类成为标签页；这个则把条目混在一起。
         /// 只调整归属，不删除任何磁盘文件。
         /// </summary>
-        private void AddMergeMenu(ContextMenuStrip menu, int gi)
+        private void AddMergeMenu(ToolStripItemCollection menu, int gi)
         {
             if (menu == null) return;
             if (gi < 0 || gi >= _layout.Groups.Count) return;
@@ -3588,7 +3784,7 @@ namespace DesktopIconManager.UI
                     null, delegate { MergeGroups(gi, target); });
             }
 
-            menu.Items.Add(sub);
+            menu.Add(sub);
         }
 
         /// <summary>右键某个分类标签：切换 / 重命名 / 拆出 / 解散。</summary>
