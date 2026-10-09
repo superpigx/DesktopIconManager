@@ -46,6 +46,13 @@ namespace DesktopIconManager.UI
         /// <summary>请求打开设置窗口。</summary>
         public event EventHandler OpenSettings;
 
+        /// <summary>托盘「桌面助手 ▸ 双击隐藏桌面图标」：立即切换一次。</summary>
+        public event EventHandler ToggleDesktopIcons;
+
+        /// <summary>托盘「桌面助手 ▸ 从快捷隐藏中排除」勾选变化。
+        /// 参数为空表示「清空所有排除」。</summary>
+        public event EventHandler ExcludeChanged;
+
         private ToolStripMenuItem _lockItem;
         private ToolStripMenuItem _snapItem;
 
@@ -74,6 +81,17 @@ namespace DesktopIconManager.UI
 
             _menu.Items.Add("整理对齐", null, delegate { Raise(TidyAll); });
 
+            // ---- 桌面助手 ▸（对齐参考实现的托盘菜单）----
+            var assistant = new ToolStripMenuItem("桌面助手");
+            assistant.DropDownItems.Add("双击隐藏桌面图标", null,
+                delegate { Raise(ToggleDesktopIcons); });
+            var miExclude = new ToolStripMenuItem("从快捷隐藏中排除");
+            miExclude.DropDownOpening += RebuildExcludeMenu;
+            assistant.DropDownItems.Add(miExclude);
+            assistant.DropDownItems.Add(new ToolStripSeparator());
+            assistant.DropDownItems.Add("恢复初始桌面", null, delegate { Raise(Relayout); });
+            _menu.Items.Add(assistant);
+
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add("设置…", null, delegate { Raise(OpenSettings); });
             _menu.Items.Add(new ToolStripSeparator());
@@ -91,6 +109,65 @@ namespace DesktopIconManager.UI
             _notify.Visible = true;
             _notify.DoubleClick += delegate { Raise(TogglePanels); };
         }
+
+        /// <summary>
+        /// 打开「从快捷隐藏中排除」时重建菜单项并同步勾选态。
+        ///
+        /// 勾选态必须每次打开都重读 —— 收纳盒可能被增删，
+        /// 缓存的菜单项会显示过时的内容。
+        /// </summary>
+        private void RebuildExcludeMenu(object sender, EventArgs e)
+        {
+            var item = sender as ToolStripMenuItem;
+            if (item == null) return;
+
+            string[] titles = QueryBoxTitles();
+            bool[] states = QueryExcludeStates();
+
+            item.DropDownItems.Clear();
+
+            if (titles == null || titles.Length == 0)
+            {
+                var none = new ToolStripMenuItem("（暂无收纳盒）");
+                none.Enabled = false;
+                item.DropDownItems.Add(none);
+                return;
+            }
+
+            for (int i = 0; i < titles.Length; i++)
+            {
+                int index = i;
+                var mi = new ToolStripMenuItem(titles[i]);
+                mi.Checked = (states != null && i < states.Length && states[i]);
+                mi.Click += delegate
+                {
+                    RaiseWithIndex(ExcludeChanged, index, mi.Checked);
+                };
+                item.DropDownItems.Add(mi);
+            }
+        }
+
+        /// <summary>由宿主回填当前收纳盒清单与排除状态。</summary>
+        public Func<string[]> QueryBoxTitles;
+        public Func<bool[]> QueryExcludeStates;
+
+        private static void RaiseWithIndex(EventHandler handler, int index, bool value)
+        {
+            if (handler == null) return;
+
+            // 复用 EventHandler 的签名不便传参，这里用闭包 +
+            // 一个静态的 Action 字段桥接：直接在调用点 Invoke 更清晰，
+            // 所以退化为「无参事件 + 静态当前值」由宿主读取。
+            PendingExcludeIndex = index;
+            PendingExcludeValue = value;
+            handler(null, EventArgs.Empty);
+        }
+
+        /// <summary>最近一次「从快捷隐藏中排除」操作的盒子下标（宿主读取）。</summary>
+        public static int PendingExcludeIndex = -1;
+
+        /// <summary>最近一次「从快捷隐藏中排除」操作的目标值（宿主读取）。</summary>
+        public static bool PendingExcludeValue;
 
         private void Raise(EventHandler handler)
         {

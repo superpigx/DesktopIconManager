@@ -212,14 +212,6 @@ namespace DesktopIconManager.Core
         /// <summary>是否降序（仅对非 Manual 有意义）。再点一次同一模式即切换方向。</summary>
         public bool SortDescending { get; set; }
 
-        /// <summary>
-        /// 「从快捷隐藏中排除」——勾上后该分类**不参与启动时的自动整理**。
-        ///
-        /// 语义对齐参考实现：手工摆好的一堆文件，下次启动不该被规则打散。
-        /// 逐分类生效（不是整盒），因为同一盒里不同分类的意愿可能不同。
-        /// </summary>
-        public bool ExcludeFromAutoOrganize { get; set; }
-
         // ---- 排序结果缓存（不进存档）----
         // 渲染每帧都要用顺序表，不能每帧都排序；条目增删会让 Items.Count 变化，
         // 缓存签名因此自动失效，无需到处手动清。
@@ -399,6 +391,14 @@ namespace DesktopIconManager.Core
         /// 一次只看当前分类的内容。面板高度不变，只是省掉标签行那一条。
         /// </summary>
         public bool TabBarCollapsed { get; set; }
+
+        /// <summary>
+        /// 「从快捷隐藏中排除」—— 双击桌面隐藏所有图标时，这个盒子**保持可见**。
+        ///
+        /// 挂在盒级而不是分类级：隐藏的单位本来就是整个格子。
+        /// 典型用法：把「正在用的那一盒」钉在桌面上，双击清爽一下时它不动。
+        /// </summary>
+        public bool ExcludeFromHide { get; set; }
 
         public List<FenceTab> Tabs { get; private set; }
 
@@ -719,6 +719,8 @@ namespace DesktopIconManager.Core
                   .Append('\t').Append(g.Locked ? "1" : "0")
                   // 第 10 列（可选）：分类标签栏是否收起。缺省视为不收起。
                   .Append('\t').Append(g.TabBarCollapsed ? "1" : "0")
+                  // 第 11 列（可选）：从快捷隐藏中排除（双击隐藏桌面时它保持可见）
+                  .Append('\t').Append(g.ExcludeFromHide ? "1" : "0")
                   .Append("\r\n");
 
                 foreach (FenceTab tab in g.Tabs)
@@ -749,10 +751,6 @@ namespace DesktopIconManager.Core
                         sb.Append('\t').Append((int)tab.SortMode)
                           .Append('\t').Append(tab.SortDescending ? "1" : "0");
                     }
-
-                    // 第 13 列（可选）：是否「从快捷隐藏中排除」
-                    if (tab.ExcludeFromAutoOrganize)
-                        sb.Append('\t').Append("1");
 
                     sb.Append("\r\n");
 
@@ -839,6 +837,8 @@ namespace DesktopIconManager.Core
                     bool locked = p.Length >= 9 && p[8] == "1";
                     // 第 10 个字段（标签栏收起）可选：缺省不收起
                     bool tabCollapsed = p.Length >= 10 && p[9] == "1";
+                    // 第 11 个字段（从快捷隐藏中排除）可选：缺省不排除
+                    bool excludeHide = p.Length >= 11 && p[10] == "1";
 
                     box = new FenceBox();
                     box.Tabs.Clear();          // 分类全部由 T 行建立
@@ -847,6 +847,7 @@ namespace DesktopIconManager.Core
                     box.ActiveTab = active;
                     box.Locked = locked;
                     box.TabBarCollapsed = tabCollapsed;
+                    box.ExcludeFromHide = excludeHide;
                     box.ViewMode = ParseViewMode(view);
 
                     layout.Groups.Add(box);
@@ -914,9 +915,6 @@ namespace DesktopIconManager.Core
                             tab.SortDescending = (p.Length >= 12 && p[11] == "1");
                         }
                     }
-
-                    // 第 13 列（可选）：从快捷隐藏中排除
-                    if (p.Length >= 13) tab.ExcludeFromAutoOrganize = (p[12] == "1");
 
                     box.Tabs.Add(tab);
                     curTab = tab;              // ← 后续 I 行写进这个分类

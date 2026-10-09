@@ -692,6 +692,98 @@ namespace DesktopIconManager.UI
             return _renderer.HeaderHeight(box.Tabs.Count, box.TabBarCollapsed);
         }
 
+        /// <summary>
+        /// 某个盒子当前是否应该被绘制 / 接收鼠标。
+        ///
+        /// 双击桌面隐藏所有图标时，勾了「从快捷隐藏中排除」的盒子
+        /// 仍然显示 —— 它是用户特意留在桌面上的那一盒。
+        ///
+        /// 渲染与所有命中测试都必须过这一层：不可见的盒子如果还能被点到，
+        /// 就会出现「看不见却点得动」的幽灵面板。
+        /// </summary>
+        private bool IsGroupVisible(int gi)
+        {
+            if (gi < 0 || gi >= _layout.Groups.Count) return false;
+
+            FenceBox box = _layout.Groups[gi];
+            if (box.ExcludeFromHide) return true;
+
+            return _panelsVisible;
+        }
+
+        private bool IsGroupVisible(FenceBox box)
+        {
+            return box != null && IsGroupVisible(_layout.Groups.IndexOf(box));
+        }
+
+        /// <summary>
+        /// 双击桌面空白处：隐藏 / 显示所有收纳盒。
+        ///
+        /// 对应参考实现托盘菜单里的「双击隐藏桌面图标」。
+        /// 开着「从快捷隐藏中排除」的盒子不受影响。
+        /// </summary>
+        public void ToggleDesktopIcons()
+        {
+            _panelsVisible = !_panelsVisible;
+
+            // 隐藏时把悬停态清掉，否则鼠标一动就会在看不见的面板上点亮高亮
+            _hoverGroup = -1;
+            _hoverItem = -1;
+            _hoverTab = -1;
+            _hoverGrip = -1;
+
+            UpdateCursor();
+            Render();
+
+            AppLog.Info(_panelsVisible ? "已显示全部收纳盒" : "已隐藏全部收纳盒（排除项保持可见）");
+        }
+
+        /// <summary>设置某个盒的「从快捷隐藏中排除」。index &lt; 0 表示无。</summary>
+        public void SetExcludeFromHide(int index, bool value)
+        {
+            if (index < 0 || index >= _layout.Groups.Count) return;
+
+            if (_layout.Groups[index].ExcludeFromHide == value) return;
+
+            _layout.Groups[index].ExcludeFromHide = value;
+            MarkDirty();
+            Render();
+        }
+
+        /// <summary>该盒是否被排除在隐藏之外（托盘菜单显示勾选态用）。</summary>
+        public bool IsExcludedFromHide(int index)
+        {
+            if (index < 0 || index >= _layout.Groups.Count) return false;
+            return _layout.Groups[index].ExcludeFromHide;
+        }
+
+        /// <summary>当前收纳盒是否处于「已隐藏」状态。</summary>
+        public bool PanelsHidden { get { return !_panelsVisible; } }
+
+        /// <summary>全部收纳盒的标题（托盘「从快捷隐藏中排除」菜单用）。</summary>
+        public string[] BoxTitles
+        {
+            get
+            {
+                var names = new string[_layout.Groups.Count];
+                for (int i = 0; i < _layout.Groups.Count; i++)
+                    names[i] = _layout.Groups[i].Title;
+                return names;
+            }
+        }
+
+        /// <summary>各收纳盒的排除状态（与 <see cref="BoxTitles"/> 同序）。</summary>
+        public bool[] BoxExcludeStates
+        {
+            get
+            {
+                var states = new bool[_layout.Groups.Count];
+                for (int i = 0; i < _layout.Groups.Count; i++)
+                    states[i] = _layout.Groups[i].ExcludeFromHide;
+                return states;
+            }
+        }
+
         /// <summary>该盒当前是否显示分类标签行（多分类且未收起）。</summary>
         private static bool TabBarVisible(FenceBox box)
         {
@@ -1945,6 +2037,8 @@ namespace DesktopIconManager.UI
             for (int gi = 0; gi < _layout.Groups.Count; gi++)
             {
                 FenceBox box = _layout.Groups[gi];
+                if (!IsGroupVisible(gi)) continue;   // 双击隐藏时不可见
+
                 Rectangle bounds = ToLocal(box.Bounds);
 
                 if (!bounds.IntersectsWith(view)) continue;
@@ -2327,6 +2421,8 @@ namespace DesktopIconManager.UI
         {
             for (int gi = _layout.Groups.Count - 1; gi >= 0; gi--)
             {
+                if (!IsGroupVisible(gi)) continue;
+
                 Rectangle b = ToLocal(_layout.Groups[gi].Bounds);
                 var title = new Rectangle(b.X, b.Y, b.Width, _theme.TitleHeight);
                 if (title.Contains(p)) return gi;
@@ -2346,6 +2442,8 @@ namespace DesktopIconManager.UI
 
             for (int gi = _layout.Groups.Count - 1; gi >= 0; gi--)
             {
+                if (!IsGroupVisible(gi)) continue;
+
                 Rectangle b = ToLocal(_layout.Groups[gi].Bounds);
                 if (!b.Contains(p)) continue;
 
@@ -2424,6 +2522,8 @@ namespace DesktopIconManager.UI
             groupIndex = -1;
             for (int gi = _layout.Groups.Count - 1; gi >= 0; gi--)
             {
+                if (!IsGroupVisible(gi)) continue;
+
                 Rectangle b = ToLocal(_layout.Groups[gi].Bounds);
                 var grip = new Rectangle(b.Right - ResizeGrip, b.Bottom - ResizeGrip,
                                          ResizeGrip, ResizeGrip);
@@ -2439,6 +2539,8 @@ namespace DesktopIconManager.UI
 
             for (int gi = _layout.Groups.Count - 1; gi >= 0; gi--)
             {
+                if (!IsGroupVisible(gi)) continue;
+
                 FenceBox box = _layout.Groups[gi];
                 if (box.Collapsed) continue;
 
@@ -2476,6 +2578,8 @@ namespace DesktopIconManager.UI
 
             for (int gi = _layout.Groups.Count - 1; gi >= 0; gi--)
             {
+                if (!IsGroupVisible(gi)) continue;
+
                 FenceBox box = _layout.Groups[gi];
                 if (!TabBarVisible(box)) continue;   // 收起时不响应标签点击
 
@@ -2499,6 +2603,10 @@ namespace DesktopIconManager.UI
         {
             for (int gi = _layout.Groups.Count - 1; gi >= 0; gi--)
             {
+                if (!IsGroupVisible(gi)) continue;
+
+                if (!IsGroupVisible(gi)) continue;
+
                 if (ToLocal(_layout.Groups[gi].Bounds).Contains(p)) return gi;
             }
             return -1;
@@ -3021,7 +3129,14 @@ namespace DesktopIconManager.UI
                 _layout.Groups[gi].Collapsed = !_layout.Groups[gi].Collapsed;
                 MarkDirty();
                 Render();
+                return;
             }
+
+            // 双击**桌面空白处** → 隐藏 / 显示所有收纳盒。
+            // 对应参考实现托盘菜单里的「双击隐藏桌面图标」，
+            // 配合「从快捷隐藏中排除」使用：被排除的盒子始终留在桌面上。
+            if (e.Button == MouseButtons.Left && HitGroupBody(e.Location) < 0)
+                ToggleDesktopIcons();
         }
 
         /// <summary>用系统默认程序打开一个图标项。</summary>
@@ -3322,15 +3437,16 @@ namespace DesktopIconManager.UI
                 menu.Items.Add(new ToolStripSeparator());
 
                 // ---- 从快捷隐藏中排除 ----
-                // 语义：该分类不参与「启动时自动整理」，
-                // 手动收进来的文件不会被下次启动按规则打散
-                FenceTab cur = box.Current;
+                // 语义：双击桌面隐藏所有图标时，这个**盒子**保持可见。
+                // 勾在盒级而不是分类级 —— 隐藏的单位就是整个格子。
                 var miExclude = new ToolStripMenuItem("从快捷隐藏中排除");
-                miExclude.Checked = cur.ExcludeFromAutoOrganize;
+                miExclude.Checked = box.ExcludeFromHide;
                 miExclude.Click += delegate
                 {
-                    FenceTab tab = _layout.Groups[gi].Current;
-                    tab.ExcludeFromAutoOrganize = !tab.ExcludeFromAutoOrganize;
+                    int idx = gi;
+                    if (idx < 0 || idx >= _layout.Groups.Count) return;
+
+                    _layout.Groups[idx].ExcludeFromHide = !_layout.Groups[idx].ExcludeFromHide;
                     MarkDirty();
                     Render();
                 };
@@ -3525,12 +3641,10 @@ namespace DesktopIconManager.UI
                 }
             }
 
-            // 「从快捷隐藏中排除」的分类不参与归类 —— 用户手工摆的位不该被动
-            bool excluded = true;
-            foreach (FenceTab tab in box.Tabs)
-                if (!tab.ExcludeFromAutoOrganize) { excluded = false; break; }
-
-            if (!excluded) moved = box.ReclassifyInPlace(new Classifier());
+            // 勾了「从快捷隐藏中排除」的盒子不参与归类 ——
+            // 用户特意留在桌面上的那一盒，不该被规则打散
+            if (!box.ExcludeFromHide)
+                moved = box.ReclassifyInPlace(new Classifier());
 
             AutoFitPanel(gi);
             MarkDirty();

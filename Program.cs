@@ -787,6 +787,20 @@ namespace DesktopIconManager
                         tray.ExitRequested += delegate { form.Close(); };
 
                         // 设置：边改边预览；取消则按原值重新应用一遍以回滚
+                        // 桌面助手 ▸ 双击隐藏桌面图标（与托盘「显示/隐藏面板」互补：
+                        // 前者管双击，后者管托盘）
+                        tray.ToggleDesktopIcons += delegate { form.ToggleDesktopIcons(); };
+
+                        // 桌面助手 ▸ 从快捷隐藏中排除
+                        tray.QueryBoxTitles = delegate { return form.BoxTitles; };
+                        tray.QueryExcludeStates = delegate { return form.BoxExcludeStates; };
+                        tray.ExcludeChanged += delegate
+                        {
+                            form.SetExcludeFromHide(
+                                TrayHost.PendingExcludeIndex,
+                                TrayHost.PendingExcludeValue);
+                        };
+
                         tray.OpenSettings += delegate
                         {
                             AppSettings working = AppSettings.Current;
@@ -878,12 +892,12 @@ namespace DesktopIconManager
 
                     foreach (FenceBox box in layout.Groups)
                     {
-                        // 排除项不参与 —— 它们留在原盒原位
+                        // 勾了「从快捷隐藏中排除」的盒子整盒不动 ——
+                        // 用户特意留在桌面上的那一盒不该被打散
+                        if (box.ExcludeFromHide) continue;
+
                         for (int i = 0; i < box.Tabs.Count; i++)
-                        {
-                            if (box.Tabs[i].ExcludeFromAutoOrganize) continue;
                             moved += MergeTabInto(layout, box, box.Tabs[i], target);
-                        }
                     }
                 }
                 else
@@ -897,11 +911,7 @@ namespace DesktopIconManager
 
                     foreach (FenceBox box in layout.Groups)
                     {
-                        bool anyNormal = false;
-                        foreach (FenceTab tab in box.Tabs)
-                            if (!tab.ExcludeFromAutoOrganize) { anyNormal = true; break; }
-
-                        if (!anyNormal) continue;
+                        if (box.ExcludeFromHide) continue;
 
                         string activeTitle = null;
                         if (keepActive[box] >= 0 && keepActive[box] < box.Tabs.Count)
