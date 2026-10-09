@@ -1,10 +1,10 @@
-MIT License
+﻿MIT License
 
 Copyright (c) 2026 Desktop Icon Manager contributors
 
-本项目由 AI 辅助编码完成（WorkBuddy / Claude Code 类 Agent）：
+本项目的代码由 AI 辅助编码完成（使用 WorkBuddy 驱动）：
 需求拆解、架构设计、代码实现、静态校验与文档整理由 AI 执行，
-人工负责方向决策、交互验收与真机验证。
+人工负责方向决策与真机验收。
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -29,7 +29,10 @@ SOFTWARE.
 第三方声明 / Third-party notices
 
 本项目仅使用 Windows 官方公开 API 与 .NET Framework（Microsoft 提供）。
-界面布局与交互范式参照了桌面整理类公开产品的**可见设计**，
-并参考了 SnowDesktop、DeskBox 等开源项目的工程思路（仅参考思路，未复制代码）。
+工程思路参考了 SnowDesktop、DeskBox 等开源项目（仅参考思路，未复制代码）。
 
-本项目未使用、反编译或复制任何第三方产品的代码、资源或内部文件。
+代码部分为本项目独立编写，未使用、反编译或复制任何第三方产品的代码。
+
+如实披露：默认主题（"原版"）中的部分**颜色数值**取自 360 桌面助手
+随安装包提供的样式定义文件 `360desktoplite_theme.xml`。
+所使用的仅为颜色数值本身，未复制该文件、其样式命名体系或任何资源文件。
