@@ -3,10 +3,19 @@ bin/
 obj/
 
 # 运行时数据（用户桌面布局与设置，不进版本库）
+# 数据实际落在 %LOCALAPPDATA%\DesktopIconManager
+# 下面几条是早期「数据放 exe 同目录」时代留下的，忽略掉以防误提交
 bin/groups.txt
 bin/settings.txt
 bin/last-error.log
 groups.combined-backup.txt
+
+# 本地归档（整理目录时暂存的旧文件）
+_old/
+
+# Python 工具缓存（tools/ 下的辅助脚本）
+__pycache__/
+*.pyc
 
 # IDE / 系统
 *.user
