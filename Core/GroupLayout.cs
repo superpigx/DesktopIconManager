@@ -492,6 +492,21 @@ namespace DesktopIconManager.Core
             var layout = new GroupLayout();
             FenceBox box = null;
 
+            // 「当前正在写入的分类」—— 必须由 T 行显式推进。
+            //
+            // ★ 这里**不能**用 box.Current：Current 返回的是 ActiveTab 指向的那个 tab，
+            // 而 ActiveTab 在整个解析过程中都停在 G 行给的值（通常 0）。
+            // 于是每个 T 行之后的所有 I 行都会被追加到**第一个** tab 里 ——
+            // 表现就是「合并成格子组后重启，所有图标都跑到第一个分类，其他分类全空」。
+            // 单分类存档（只有 1 个 T 行）恰好正确，所以这个缺陷一直藏着，
+            // 直到支持多分类组合才暴露。
+            FenceTab curTab = null;
+
+            // 条目行计数：用于「读进来的条数 ≠ 实际载入的条数」告警。
+            // 存档一旦被某次错误的读→写污染，光靠肉眼看不出来，
+            // 有这条日志就能第一时间定位（历史 bug 就吃过这个亏）。
+            int itemLines = 0;
+
             foreach (string raw in lines)
             {
                 if (string.IsNullOrEmpty(raw)) continue;
@@ -523,6 +538,7 @@ namespace DesktopIconManager.Core
                                  : BoxViewMode.LargeIcons;
 
                     layout.Groups.Add(box);
+                    curTab = null;           // 新盒还没有当前分类
                 }
                 else if (p[0] == "T" && p.Length >= 2 && box != null)
                 {
@@ -563,9 +579,12 @@ namespace DesktopIconManager.Core
                     }
 
                     box.Tabs.Add(tab);
+                    curTab = tab;              // ← 后续 I 行写进这个分类
                 }
                 else if (p[0] == "I" && p.Length >= 4 && box != null)
                 {
+                    itemLines++;
+
                     // 存档里的路径来自外部数据 —— 打开前必须校验。
                     // 这是复盘点名的「存档投毒」面：groups.txt 被篡改后
                     // 未校验的 FullPath 会被直接交给 ShellExecute。
@@ -576,14 +595,39 @@ namespace DesktopIconManager.Core
                         continue;
                     }
 
-                    FenceTab tab = box.Current;
-                    tab.Items.Add(new GroupItem(Unescape(p[2]), full, p[1] == "1"));
+                    // 没有 T 行的条目（手改存档 / 文件被截断）不能丢：
+                    // 退到该盒第一个分类，连它都没有就补一个
+                    if (curTab == null)
+                    {
+                        curTab = (box.Tabs.Count > 0) ? box.Tabs[0] : null;
+                        if (curTab == null)
+                        {
+                            curTab = new FenceTab("未归类");
+                            box.Tabs.Add(curTab);
+                        }
+                    }
+
+                    curTab.Items.Add(new GroupItem(Unescape(p[2]), full, p[1] == "1"));
                 }
             }
 
             // 兜底：G 行后没有任何 T 行的盒子补一个空分类
             foreach (FenceBox b in layout.Groups)
                 if (b.Tabs.Count == 0) b.Tabs.Add(new FenceTab("新分类"));
+
+            // 读进来的 I 行数 ≠ 实际载入的条数 → 有条目被丢弃或格式异常，记日志。
+            // 这是「存档被写坏」的唯一可观测点，必须记。
+            int loaded = 0;
+            foreach (FenceBox b in layout.Groups)
+                foreach (FenceTab t in b.Tabs)
+                    loaded += t.Items.Count;
+
+            if (itemLines != loaded)
+            {
+                AppLog.Warn("布局存档条目数不一致：文件内 " + itemLines
+                    + " 条，实际载入 " + loaded + " 条（路径不合法被丢弃 "
+                    + LastLoadSkipped + " 条）");
+            }
 
             return layout;
         }

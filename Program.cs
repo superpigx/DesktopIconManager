@@ -80,6 +80,7 @@ namespace DesktopIconManager
                 case "settings":  return RunSettings();
                 case "show-icons": return RunShowIcons();
                 case "stats":     return RunStats();
+                case "dump-layout": return RunDumpLayout();
                 default:
                     PrintUsage();
                     return 1;
@@ -1009,6 +1010,166 @@ namespace DesktopIconManager
         // ============================================================
 
         /// <summary>
+        /// 打印「存档解析后的布局全景」（只读，不改任何文件）。
+        ///
+        /// 用来回答一类很难猜的问题：图标到底是**存错了**、**读错了**，
+        /// 还是**画错了**。逐项列出每个盒 / 每个分类的
+        /// 条目数、来源记录、面板容量、以及条目是否装得下，
+        /// 一眼就能定位到是哪一层出的问题。
+        /// </summary>
+        private static int RunDumpLayout()
+        {
+            Header("布局诊断 · 存档解析结果");
+
+            string path = GroupLayout.DefaultPath();
+            Console.WriteLine("  布局文件: " + path);
+            Console.WriteLine("  [安全声明] 本模式只读，不写文件、不动桌面。");
+            Console.WriteLine();
+
+            if (!GroupLayout.IsLayoutFile(path))
+            {
+                Console.WriteLine("  （尚无布局文件）");
+                Footer("无数据");
+                return 0;
+            }
+
+            GroupLayout layout;
+            try { layout = GroupLayout.Load(path); }
+            catch (Exception ex)
+            {
+                Console.WriteLine("  [失败] 解析异常: " + ex.Message);
+                Footer("诊断失败");
+                return 1;
+            }
+
+            AppSettings cfg = AppSettings.Current;
+            ThemePalette theme = ThemeBinder.Build(cfg);
+
+            int maxCols = Math.Max(1, cfg.MaxColumns);
+            Console.WriteLine("  设置: 主题=" + cfg.Theme + "  最大列数=" + maxCols
+                              + "  锁定图标=" + (cfg.LockIcons ? "是" : "否"));
+            Console.WriteLine();
+
+            int totalItems = 0;
+            int totalCats = 0;
+            int multiTabBoxes = 0;
+            var problems = new List<string>();
+
+            // 条目路径 → 出现次数（跨分类重复检测）
+            var pathCount = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var pathWhere = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            using (var renderer = new GroupPanelRenderer(theme))
+            {
+                for (int gi = 0; gi < layout.Groups.Count; gi++)
+                {
+                    FenceBox b = layout.Groups[gi];
+                    totalCats += b.Tabs.Count;
+                    if (b.Tabs.Count > 1) multiTabBoxes++;
+
+                    Console.WriteLine("  ┌─ 盒 #" + gi + "  " + b.Bounds.X + "," + b.Bounds.Y
+                        + "  " + b.Bounds.Width + "×" + b.Bounds.Height
+                        + (b.Locked ? "  [锁定]" : "")
+                        + (b.Collapsed ? "  [折叠]" : "")
+                        + "  布局=" + ViewName(b.ViewMode)
+                        + "  当前分类=" + (b.ActiveTab + 1) + "/" + b.Tabs.Count);
+
+                    for (int ti = 0; ti < b.Tabs.Count; ti++)
+                    {
+                        FenceTab t = b.Tabs[ti];
+                        totalItems += t.Items.Count;
+
+                        int headerH = renderer.HeaderHeight(b.Tabs.Count);
+                        int cols, rows;
+                        renderer.MeasureCapacity(b.Bounds, headerH, b.ViewMode,
+                                                 out cols, out rows);
+                        int capacity = cols * rows;
+
+                        string title = string.IsNullOrEmpty(t.Title) ? "(未命名)" : t.Title;
+                        string flag = (ti == b.ActiveTab) ? " ←当前" : "";
+
+                        Console.WriteLine("  │  · " + (ti + 1) + " " + title
+                            + "  条目 " + t.Items.Count
+                            + "  容量 " + cols + "×" + rows + "=" + capacity
+                            + flag);
+
+                        if (t.Items.Count > capacity)
+                        {
+                            problems.Add("盒#" + gi + " 分类「" + title + "」有 " + t.Items.Count
+                                + " 个条目，面板只装得下 " + capacity
+                                + " 个 —— 会被裁掉 " + (t.Items.Count - capacity) + " 个");
+                        }
+
+                        if (t.Origin != null)
+                            Console.WriteLine("  │      来源记录: " + t.Origin.Bounds.X + ","
+                                + t.Origin.Bounds.Y + "  " + t.Origin.Bounds.Width + "×"
+                                + t.Origin.Bounds.Height + "  布局=" + ViewName(t.Origin.ViewMode)
+                                + (t.Origin.Locked ? " [锁]" : "")
+                                + (t.Origin.Collapsed ? " [折叠]" : ""));
+                        else
+                            Console.WriteLine("  │      来源记录: 无（拆开时按自动排布）");
+
+                        foreach (GroupItem it in t.Items)
+                        {
+                            if (string.IsNullOrEmpty(it.FullPath)) continue;
+                            if (pathCount.ContainsKey(it.FullPath))
+                            {
+                                pathCount[it.FullPath]++;
+                                problems.Add("重复条目: " + it.Name + " 同时在「"
+                                    + pathWhere[it.FullPath] + "」与「盒#" + gi + "/" + title + "」");
+                            }
+                            else
+                            {
+                                pathCount[it.FullPath] = 1;
+                                pathWhere[it.FullPath] = "盒#" + gi + "/" + title;
+                            }
+                        }
+                    }
+
+                    Console.WriteLine("  └" + new string('─', 58));
+                    Console.WriteLine();
+                }
+            }
+
+            Console.WriteLine("  【汇总】");
+            Console.WriteLine("  " + new string('-', 63));
+            Console.WriteLine("  收纳盒 " + layout.Groups.Count + " 个"
+                + "（其中 " + multiTabBoxes + " 个已组合成格子组）");
+            Console.WriteLine("  分类共 " + totalCats + " 个");
+            Console.WriteLine("  条目共 " + totalItems + " 条，去重后 " + pathCount.Count + " 条");
+            if (GroupLayout.LastLoadSkipped > 0)
+                Console.WriteLine("  路径不合法被丢弃: " + GroupLayout.LastLoadSkipped + " 条");
+            Console.WriteLine();
+
+            if (problems.Count == 0)
+            {
+                Console.WriteLine("  [结论] 存档结构正常：无溢出、无重复条目。");
+                Console.WriteLine("          若界面上仍显示异常，问题在渲染 / 尺寸而非存档。");
+            }
+            else
+            {
+                Console.WriteLine("  [发现 " + problems.Count + " 处问题]");
+                for (int i = 0; i < problems.Count && i < 40; i++)
+                    Console.WriteLine("    " + (i + 1) + ". " + problems[i]);
+                if (problems.Count > 40)
+                    Console.WriteLine("    … 其余 " + (problems.Count - 40) + " 处省略");
+            }
+
+            Footer("诊断完成（只读，未改动任何文件）");
+            return 0;
+        }
+
+        private static string ViewName(BoxViewMode v)
+        {
+            switch (v)
+            {
+                case BoxViewMode.SmallIcons: return "小图标";
+                case BoxViewMode.List: return "列表";
+                default: return "大图标";
+            }
+        }
+
+        /// <summary>
         /// 描述布局规模：收纳盒数 / 分类总数 / 已组合的盒子数。
         ///
         /// 一个收纳盒可以含多个分类（标签页），所以「盒子数」与「分类数」
@@ -1169,8 +1330,10 @@ namespace DesktopIconManager
             Console.WriteLine("  --shell --console  同上，但保留控制台窗口（便于看日志）");
             Console.WriteLine("  --settings   打开设置窗口（不接管桌面，可随时运行）");
             Console.WriteLine("               主题 / 尺寸 / 吸附 / 分类规则都在这里改");
-            Console.WriteLine("  --show-icons 应急：恢复系统桌面图标");
-            Console.WriteLine("  --stats      输出版本 / 数据目录 / 布局 / 性能开关 / 运行指标");
+Console.WriteLine("  --show-icons 应急：恢复系统桌面图标");
+        Console.WriteLine("  --stats      输出版本 / 数据目录 / 布局 / 性能开关 / 运行指标");
+        Console.WriteLine("  --dump-layout 只读诊断：打印存档解析后的每个盒 / 每个分类的");
+        Console.WriteLine("               条目数、来源记录、面板容量，并报告溢出与重复条目");
             Console.WriteLine();
             Console.WriteLine("  --utf8       强制控制台 UTF-8 输出（仅 UTF-8 终端需要）");
             Console.WriteLine();
